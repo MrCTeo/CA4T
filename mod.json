@@ -1,0 +1,47 @@
+{
+  "geode": "5.1.0",
+  "gd": {
+    "win": "2.2081",
+    "android": "2.2081",
+    "mac": "2.2081"
+  },
+  "id": "yourname.click-assist",
+  "name": "Click Assist (Practice)",
+  "version": "v0.1.0",
+  "developer": "YourName",
+  "description": "Practice aid: if an early click would kill you, retries it up to N ticks later. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
+  "settings": {
+    "enabled": {
+      "type": "bool",
+      "name": "Enable Click Assist",
+      "description": "Turns the assist on. While on, the attempt runs in test mode and nothing is saved.",
+      "default": false
+    },
+    "window": {
+      "type": "int",
+      "name": "Assist window (ticks)",
+      "description": "How many ticks too early a click can be and still get corrected. GD runs at 240 ticks per second, so 4 ticks is about 17 ms.",
+      "default": 4,
+      "min": 1,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "lookahead": {
+      "type": "int",
+      "name": "Death lookahead (ticks)",
+      "description": "How long after a click a death still counts as caused by that click. 120 ticks is half a second.",
+      "default": 120,
+      "min": 10,
+      "max": 480,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    }
+  }
+}
