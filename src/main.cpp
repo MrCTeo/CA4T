@@ -109,9 +109,9 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
     }
 
     // Called once per physics tick (240 per second).
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (!assistEnabled() || !isActivePlayLayer()) {
-            return GJBaseGameLayer::processCommands(dt);
+            return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
 
         auto pl = PlayLayer::get();
@@ -135,7 +135,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             injectButton(this, false);
         }
 
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         s.tick++;
 
         // Survived long enough after the press: stop tracking it.
