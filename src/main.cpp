@@ -8,7 +8,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v4b";
+static constexpr char const* kBuildTag = "tracer-v6";
 
 // =====================================================================
 // How it works
@@ -31,6 +31,7 @@ static constexpr char const* kBuildTag = "tracer-v4b";
 
 static bool assistEnabled()  { return Mod::get()->getSettingValue<bool>("enabled"); }
 static int  assistWindow()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("window")); }
+static int  releaseWindow()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-window")); }
 static int  lookaheadTicks() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead")); }
 static int  waveLookahead()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
@@ -103,6 +104,7 @@ static AssistState s;
 // ---------- debug panel ----------
 
 static void debugLine(std::string const& line) {
+    if (line.rfind("   ", 0) != 0) log::info("[CA] {}", line);
     s.lines.push_back(line);
     while (s.lines.size() > 8) s.lines.pop_front();
     if (!s.debugLabel) return;
@@ -114,8 +116,13 @@ static void debugLine(std::string const& line) {
 static void debugDiag() {
     if (!s.diagReason.empty()) {
         debugLine("   SKIPPED: " + s.diagReason);
+        log::info("[CA]    SKIPPED: {}", s.diagReason);
         return;
     }
+    log::info("[CA]    ticks {} moved {:.1f},{:.1f} start-off {:.1f} coll {} objs {} orbs {} backup {} timeout {} dt {:.5f}/{:.5f}",
+              s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
+              s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagFallbackDeaths,
+              s.diagTimedOut, s.playerDt, s.collideDt);
     debugLine(fmt::format("   ticks {} moved {:.0f},{:.0f} start-off {:.1f} coll {} objs {} orbs {}{}{}",
                           s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
                           s.diagCollChecks, s.diagMaxObjs, s.diagOrbs,
@@ -336,7 +343,8 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     auto deadline = start + std::chrono::microseconds(2000);
 
     int look = pl->m_player1->m_isDart ? waveLookahead() : lookaheadTicks();
-    int window = assistWindow();
+    // Presses and releases each have their own search window.
+    int window = in.down ? assistWindow() : releaseWindow();
     int chosen = 0;
     in.foundSafe = false;
     in.firstDeath = -1;
@@ -571,7 +579,7 @@ class $modify(AssistPlayLayer, PlayLayer) {
         bool on = assistEnabled();
         if (auto label = m_fields->label) {
             label->setVisible(on);
-            if (on) label->setString(fmt::format("CA {}t {}", assistWindow(), kBuildTag).c_str());
+            if (on) label->setString(fmt::format("CA {}p/{}r {}", assistWindow(), releaseWindow(), kBuildTag).c_str());
         }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
