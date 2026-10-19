@@ -9,7 +9,7 @@
   "name": "Click Assist (Practice)",
   "version": "v0.1.0",
   "developer": "YourName",
-  "description": "Practice aid: if a click would kill you, an invisible tracer finds the first safe tick within the next few ticks and sends the click there. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
+  "description": "Practice aid: an invisible tracer checks every press and release, and sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
   "settings": {
     "enabled": {
       "type": "bool",
@@ -37,6 +37,19 @@
       "default": 20,
       "min": 5,
       "max": 120,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "wave-lookahead": {
+      "type": "int",
+      "name": "Wave safety check (ticks)",
+      "description": "Safety check used while you're in wave. Wave inputs come fast, so this is shorter: an input only has to stay safe until your next one usually arrives.",
+      "default": 10,
+      "min": 3,
+      "max": 40,
       "control": {
         "slider": true,
         "arrows": true,
