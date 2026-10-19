@@ -10,74 +10,79 @@ using namespace geode::prelude;
 // =====================================================================
 // How it works
 //
-// When you click, an invisible copy of your player (the "tracer") is sent
-// forward along the trajectory that click would give you. If it survives the
-// safety check, the click goes through immediately and untouched.
-// If it dies, the click is held, and on each following real tick the tracer
-// checks again. The click is sent on the first tick where it doesn't die
-// (or at the end of the search window if none is safe).
+// Every input (press AND release) is checked by an invisible tracer: a copy
+// of your player that flies ahead along the trajectory that input would give
+// you. It tries the input on tick +0, +1, ... up to the search window, and
+// the input is sent on the first tick where the tracer doesn't die.
+// If no tick in the window is safe, the input is sent on time, unchanged.
 //
-// The real game is never rewound or copied, so there are no snapshots,
-// no wave trail resets and no physics changes. The only thing that ever
-// changes is the tick your click is sent on.
+// Releases are checked too. On wave a release is just as deadly as a press,
+// so both directions are covered.
+//
+// The tracer never touches the real game: no snapshots, no rewinds, no wave
+// trail resets, no physics changes. Safe inputs go through with zero delay.
 // =====================================================================
 
 // ---------- settings ----------
 
-static bool assistEnabled() { return Mod::get()->getSettingValue<bool>("enabled"); }
-static int  assistWindow()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("window")); }
-static int  lookaheadTicks(){ return static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead")); }
-static bool debugPanel()    { return Mod::get()->getSettingValue<bool>("debug"); }
+static bool assistEnabled()  { return Mod::get()->getSettingValue<bool>("enabled"); }
+static int  assistWindow()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("window")); }
+static int  lookaheadTicks() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead")); }
+static int  waveLookahead()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead")); }
+static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
 
 // ---------- state ----------
 
-struct AssistState {
-    int tick = 0;                        // real physics ticks this attempt
+struct PendingInput {
+    bool down = true;
+    int realTick = 0;        // tick you actually pressed/released
+    int base = 0;            // earliest tick it may be sent (keeps your hold length)
+    int fireTick = -1;       // -1 = not planned yet
+    int firstDeath = -1;     // where the on-time input would have died
+    bool foundSafe = true;
+};
 
-    // Tracer (invisible fake player)
+struct AssistState {
+    int tick = 0;
+
+    // Tracer
     PlayerObject* fake = nullptr;
-    PlayLayer* owner = nullptr;          // which PlayLayer the tracer belongs to
+    PlayLayer* owner = nullptr;
     bool tracing = false;
     bool traceDied = false;
     bool traceDone = false;
-    float playerDt = 0.f;                // dt the game gives PlayerObject::update
-    float collideDt = 0.f;               // dt the game gives checkCollisions
+    float playerDt = 0.f;
+    float collideDt = 0.f;
 
-    // Click handling
-    bool waiting = false;                // a click is being held for a safe tick
-    int waited = 0;                      // ticks waited so far
-    int firstDeath = -1;                 // where the on-time click would have died
-    int realPressTick = -1;
-    int releaseHold = -1;                // known hold length if released while waiting
-    int lastHold = 6;                    // last hold length, used to guess the next one
-    bool pressDown = false;              // our delayed press is down in-game
-    int pressFireTick = -1;
-    int releaseTick = -1;
+    // Inputs
+    std::deque<PendingInput> queue;
+    bool heldInGame = false;   // what the game currently thinks the button is
+    int pressShift = 0;        // how late the last press was sent (applied to its release)
     bool injecting = false;
-    double clickMs = 0.0;                // tracer time spent on the current click
+    double planMs = 0.0;
+
+    // Diagnostics (last trace)
+    int diagTicks = 0;
+    int diagCollChecks = 0;
+    int diagMaxObjs = 0;
+    float diagMovedX = 0.f;
+    float diagMovedY = 0.f;
+    float diagStartDiff = 0.f;
+    bool diagTimedOut = false;
+    std::string diagReason;
 
     // Debug panel
     CCLabelBMFont* debugLabel = nullptr;
     std::deque<std::string> lines;
 
-    void clearPress() {
-        waiting = false;
-        waited = 0;
-        firstDeath = -1;
-        realPressTick = -1;
-        releaseHold = -1;
-        pressDown = false;
-        pressFireTick = -1;
-        releaseTick = -1;
-        clickMs = 0.0;
-    }
-
     void reset() {
-        clearPress();
         tick = 0;
         tracing = false;
         traceDied = false;
         traceDone = false;
+        queue.clear();
+        heldInGame = false;
+        pressShift = 0;
         injecting = false;
         lines.clear();
     }
@@ -85,16 +90,29 @@ struct AssistState {
 
 static AssistState s;
 
-// ---------- helpers ----------
+// ---------- debug panel ----------
 
 static void debugLine(std::string const& line) {
     s.lines.push_back(line);
-    while (s.lines.size() > 6) s.lines.pop_front();
+    while (s.lines.size() > 8) s.lines.pop_front();
     if (!s.debugLabel) return;
     std::string text;
     for (auto& l : s.lines) { text += l; text += "\n"; }
     s.debugLabel->setString(text.c_str());
 }
+
+static void debugDiag() {
+    if (!s.diagReason.empty()) {
+        debugLine("   SKIPPED: " + s.diagReason);
+        return;
+    }
+    debugLine(fmt::format("   ticks {} moved {:.0f},{:.0f} start-off {:.1f} coll {} objs {}{}",
+                          s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
+                          s.diagCollChecks, s.diagMaxObjs,
+                          s.diagTimedOut ? " TIMEOUT" : ""));
+}
+
+// ---------- tracer ----------
 
 static void injectButton(GJBaseGameLayer* layer, bool down) {
     s.injecting = true;
@@ -105,8 +123,7 @@ static void injectButton(GJBaseGameLayer* layer, bool down) {
 static bool ensureTracer(PlayLayer* pl) {
     if (s.fake && s.owner == pl) return true;
 
-    // Hidden layer: the tracer and anything it spawns (particles, trails)
-    // live in here and are never drawn.
+    // Hidden layer: the tracer and anything it spawns are never drawn.
     auto hidden = CCLayer::create();
     hidden->setVisible(false);
     pl->addChild(hidden, -1000);
@@ -121,47 +138,119 @@ static bool ensureTracer(PlayLayer* pl) {
     return true;
 }
 
-// Sends the tracer along the trajectory of "click now, hold for holdTicks".
-// Returns the tick it died on, or -1 if it survived the safety check.
-static int traceClick(PlayLayer* pl, int holdTicks) {
-    if (s.playerDt <= 0.f || s.collideDt <= 0.f) return -1;
-    if (!ensureTracer(pl)) return -1;
+static void copyPlayerState(PlayerObject* dst, PlayerObject* src) {
+    dst->copyAttributes(src);
+    dst->m_isShip = src->m_isShip;
+    dst->m_isBird = src->m_isBird;
+    dst->m_isBall = src->m_isBall;
+    dst->m_isDart = src->m_isDart;
+    dst->m_isRobot = src->m_isRobot;
+    dst->m_isSpider = src->m_isSpider;
+    dst->m_isSwing = src->m_isSwing;
+    dst->m_isUpsideDown = src->m_isUpsideDown;
+    dst->m_vehicleSize = src->m_vehicleSize;
+    dst->m_playerSpeed = src->m_playerSpeed;
+    dst->m_isOnGround = src->m_isOnGround;
+    dst->m_yVelocity = src->m_yVelocity;
+    dst->m_position = src->m_position;
+    dst->setPosition(src->getPosition());
+}
 
-    auto start = std::chrono::steady_clock::now();
-    auto deadline = start + std::chrono::microseconds(1500);
+// Flies the tracer: keeps the current button state for `delay` ticks, then
+// applies the input (`down`), then keeps that state until `maxTicks`.
+// Returns the tick it died on, or -1 if it survived.
+static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
+                      std::chrono::steady_clock::time_point deadline) {
+    s.diagTicks = 0;
+    s.diagCollChecks = 0;
+    s.diagMaxObjs = 0;
+    s.diagMovedX = 0.f;
+    s.diagMovedY = 0.f;
+    s.diagStartDiff = 0.f;
+    s.diagTimedOut = false;
+    s.diagReason.clear();
 
-    s.fake->copyAttributes(pl->m_player1);
+    if (s.playerDt <= 0.f)  { s.diagReason = "no update dt"; return -1; }
+    if (s.collideDt <= 0.f) { s.diagReason = "no collision dt"; return -1; }
+    if (!ensureTracer(pl))  { s.diagReason = "no tracer"; return -1; }
+
+    copyPlayerState(s.fake, pl->m_player1);
+    auto startPos = s.fake->m_position;
+    s.diagStartDiff = ccpDistance(startPos, pl->m_player1->m_position);
 
     s.tracing = true;
     s.traceDied = false;
     s.traceDone = false;
 
-    s.fake->pushButton(PlayerButton::Jump);
-    bool held = true;
-    int death = -1;
-    int look = lookaheadTicks();
+    // Put the tracer in the same button state the game is in right now.
+    bool held = s.heldInGame;
+    if (held) s.fake->pushButton(PlayerButton::Jump);
+    else      s.fake->releaseButton(PlayerButton::Jump);
 
-    for (int t = 0; t < look; ++t) {
-        if (held && t >= holdTicks) {
-            s.fake->releaseButton(PlayerButton::Jump);
-            held = false;
+    int death = -1;
+    for (int t = 0; t < maxTicks; ++t) {
+        if (t == delay && held != down) {
+            if (down) s.fake->pushButton(PlayerButton::Jump);
+            else      s.fake->releaseButton(PlayerButton::Jump);
+            held = down;
         }
         s.fake->update(s.playerDt);
         pl->checkCollisions(s.fake, s.collideDt, false);
+        s.diagTicks = t + 1;
 
         if (s.traceDied) { death = t; break; }
         if (s.traceDone) break;
-        if ((t & 3) == 3 && std::chrono::steady_clock::now() > deadline) break; // treat as safe
+        if ((t & 3) == 3 && std::chrono::steady_clock::now() > deadline) {
+            s.diagTimedOut = true;
+            break;
+        }
     }
 
     if (held) s.fake->releaseButton(PlayerButton::Jump);
+    s.diagMovedX = s.fake->m_position.x - startPos.x;
+    s.diagMovedY = s.fake->m_position.y - startPos.y;
+
     s.tracing = false;
     s.traceDied = false;
     s.traceDone = false;
-
-    s.clickMs += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start).count();
     return death;
+}
+
+// Finds the first tick (+0 .. +window) where this input doesn't kill you.
+// Returns that delay, or 0 if none is safe (input is sent on time).
+static int planInput(PlayLayer* pl, PendingInput& in) {
+    auto start = std::chrono::steady_clock::now();
+    auto deadline = start + std::chrono::microseconds(2000);
+
+    int look = pl->m_player1->m_isDart ? waveLookahead() : lookaheadTicks();
+    int window = assistWindow();
+    int chosen = 0;
+    in.foundSafe = false;
+    in.firstDeath = -1;
+
+    for (int d = 0; d <= window; ++d) {
+        int death = traceInput(pl, d, in.down, d + look, deadline);
+        if (d == 0) in.firstDeath = death;
+        if (!s.diagReason.empty() || s.diagTimedOut) { chosen = 0; in.foundSafe = true; break; }
+        if (death < 0) { chosen = d; in.foundSafe = true; break; }
+    }
+
+    s.planMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    return chosen;
+}
+
+static void logDecision(PendingInput const& in, int delay) {
+    char const* what = in.down ? "press  " : "release";
+    if (in.firstDeath < 0) {
+        debugLine(fmt::format("{} +0 safe  ({:.2f}ms)", what, s.planMs));
+    } else if (in.foundSafe) {
+        debugLine(fmt::format("{} dies@{} -> +{}  ({:.2f}ms)", what, in.firstDeath, delay, s.planMs));
+    } else {
+        debugLine(fmt::format("{} dies@{}, none safe -> on time  ({:.2f}ms)",
+                              what, in.firstDeath, s.planMs));
+    }
+    debugDiag();
 }
 
 // ---------- game layer hooks ----------
@@ -172,12 +261,11 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         return pl && static_cast<GJBaseGameLayer*>(pl) == this;
     }
 
-    void firePress() {
-        injectButton(this, true);
-        s.waiting = false;
-        s.pressDown = true;
-        s.pressFireTick = s.tick;
-        if (s.releaseHold > 0) s.releaseTick = s.tick + s.releaseHold;
+    void applied(PendingInput const& in, int fireTick) {
+        s.heldInGame = in.down;
+        // A delayed press shifts its release by the same amount, so your hold
+        // length stays exactly the same. After a release, nothing carries over.
+        s.pressShift = in.down ? (fireTick - in.realTick) : 0;
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -191,55 +279,53 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
 
-        if (down) {
-            if (s.waiting) return;                        // already holding a click
-            if (s.pressDown) { injectButton(this, false); s.clearPress(); }
+        PendingInput in;
+        in.down = down;
+        in.realTick = s.tick;
+        in.base = s.tick + (down ? 0 : s.pressShift);
 
-            s.clickMs = 0.0;
-            s.realPressTick = s.tick;
-            int death = traceClick(pl, s.lastHold);
-
-            if (death < 0) {
-                // Safe right now: the click goes through untouched.
-                debugLine(fmt::format("+0 safe  ({:.2f}ms)", s.clickMs));
+        if (s.queue.empty() && in.base <= s.tick) {
+            int delay = planInput(pl, in);
+            logDecision(in, delay);
+            if (delay == 0) {
+                // Safe now (or nothing better): goes through untouched.
+                applied(in, s.tick);
                 return GJBaseGameLayer::handleButton(down, button, isPlayer1);
             }
-
-            // Not safe: hold it and keep checking on the next ticks.
-            s.waiting = true;
-            s.waited = 0;
-            s.firstDeath = death;
-            return;
+            in.fireTick = s.tick + delay;
         }
+        s.queue.push_back(in);
+    }
 
-        // ----- release -----
-        int hold = s.realPressTick >= 0 ? std::max(1, s.tick - s.realPressTick) : 1;
+    // Sends queued inputs in order, each on its planned tick.
+    void processQueue() {
+        auto pl = PlayLayer::get();
+        while (!s.queue.empty()) {
+            auto& in = s.queue.front();
 
-        if (s.waiting) {
-            // Click hasn't been sent yet: release it `hold` ticks after it is.
-            s.releaseHold = hold;
-            s.lastHold = std::clamp(hold, 1, lookaheadTicks());
-            return;
-        }
-
-        if (s.pressDown) {
-            // Delayed click: keep your hold length, shifted by the delay.
-            s.lastHold = std::clamp(hold, 1, lookaheadTicks());
-            int rt = s.pressFireTick + hold;
-            if (rt <= s.tick) {
-                s.clearPress();
-                return GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            if (in.fireTick < 0) {
+                if (s.tick < in.base) break;
+                int delay = planInput(pl, in);
+                logDecision(in, delay);
+                in.fireTick = s.tick + delay;
             }
-            s.releaseTick = rt;
-            return;
-        }
+            if (s.tick < in.fireTick) break;
 
-        // Normal click that went through on time.
-        if (s.realPressTick >= 0) {
-            s.lastHold = std::clamp(hold, 1, lookaheadTicks());
-            s.realPressTick = -1;
+            PendingInput done = in;
+            s.queue.pop_front();
+            injectButton(this, done.down);
+            applied(done, s.tick);
+
+            // A following release keeps the hold length of the press it belongs to.
+            if (done.down) {
+                for (auto& next : s.queue) {
+                    if (!next.down && next.fireTick < 0) {
+                        next.base = next.realTick + s.pressShift;
+                        break;
+                    }
+                }
+            }
         }
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
     // Called once per physics tick (240 per second).
@@ -247,43 +333,18 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         if (s.tracing || !assistEnabled() || !isActivePlayLayer()) {
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
-
-        auto pl = PlayLayer::get();
-
-        if (s.waiting) {
-            s.waited++;
-            int hold = s.releaseHold > 0 ? s.releaseHold : s.lastHold;
-            int death = traceClick(pl, hold);
-
-            if (death < 0) {
-                debugLine(fmt::format("+0 dies@{} -> sent +{}  ({:.2f}ms)",
-                                      s.firstDeath, s.waited, s.clickMs));
-                firePress();
-            }
-            else if (s.waited >= assistWindow()) {
-                debugLine(fmt::format("no safe tick -> sent +{}  ({:.2f}ms)",
-                                      s.waited, s.clickMs));
-                firePress();
-            }
-        }
-
-        if (s.pressDown && s.releaseTick >= 0 && s.tick >= s.releaseTick) {
-            injectButton(this, false);
-            s.clearPress();
-        }
-
+        processQueue();
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         s.tick++;
     }
 
-    // Records the dt the game really uses, so the tracer moves exactly like you.
     int checkCollisions(PlayerObject* player, float dt, bool ignoreDamage) {
         if (!s.tracing && isActivePlayLayer() && player == m_player1) s.collideDt = dt;
         return GJBaseGameLayer::checkCollisions(player, dt, ignoreDamage);
     }
 
-    // The tracer only collides with blocks, spikes and slopes. It can't use orbs,
-    // pads, portals, coins or triggers, so it never changes anything in the level.
+    // The tracer only collides with blocks, spikes and slopes, so it can never
+    // use orbs, pads, portals, coins or triggers in the real level.
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
                                int count, float dt) {
         if (!s.tracing || player != s.fake || !objects) {
@@ -307,6 +368,8 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
                     break;
             }
         }
+        s.diagCollChecks++;
+        s.diagMaxObjs = std::max(s.diagMaxObjs, static_cast<int>(kept.size()));
         GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
     }
 };
@@ -384,11 +447,9 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
         if (s.tracing) {
-            // The tracer hit something: record it, nothing actually dies.
             if (player == s.fake) s.traceDied = true;
             return;
         }
-        // Real deaths always go through.
         PlayLayer::destroyPlayer(player, obj);
     }
 
