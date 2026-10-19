@@ -5,11 +5,11 @@
     "android": "2.2081",
     "mac": "2.2081"
   },
-  "id": "yourname.click-assist",
+  "id": "MrCTeo.click-assist",
   "name": "Click Assist (Practice)",
   "version": "v0.1.0",
-  "developer": "YourName",
-  "description": "Practice aid: if an early click would kill you, retries it up to N ticks later. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
+  "developer": "MrCTeo",
+  "description": "Practice aid: if a click would kill you, sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
   "settings": {
     "enabled": {
       "type": "bool",
@@ -19,11 +19,11 @@
     },
     "window": {
       "type": "int",
-      "name": "Assist window (ticks)",
-      "description": "How many ticks too early a click can be and still get corrected. GD runs at 240 ticks per second, so 4 ticks is about 17 ms.",
+      "name": "Search window (ticks)",
+      "description": "How many ticks ahead to search for a safe tick to send the click on. GD runs at 240 ticks per second, so 4 ticks is about 17 ms.",
       "default": 4,
       "min": 1,
-      "max": 32,
+      "max": 10,
       "control": {
         "slider": true,
         "arrows": true,
@@ -32,11 +32,11 @@
     },
     "lookahead": {
       "type": "int",
-      "name": "Death lookahead (ticks)",
-      "description": "How long after a click a death still counts as caused by that click. 120 ticks is half a second.",
-      "default": 120,
-      "min": 10,
-      "max": 480,
+      "name": "Safety check (ticks)",
+      "description": "How many ticks after a click it must survive for that tick to count as safe. Keep this short (15-30) so later obstacles that need another click do not count.",
+      "default": 20,
+      "min": 5,
+      "max": 120,
       "control": {
         "slider": true,
         "arrows": true,
