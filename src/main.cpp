@@ -1,17 +1,3 @@
-// Click Assist (Practice) - Geode mod for Geometry Dash
-//
-// How it works:
-//  1. When you press jump, the mod saves a snapshot of the game state
-//     (the same kind of checkpoint practice mode uses) right before the press.
-//  2. If you die within the "lookahead" window after that press, the death is
-//     skipped and the game is rolled back to the snapshot.
-//  3. The press is then replayed 1 tick later. If that still dies, it tries
-//     2 ticks later, and so on, up to the "window" setting.
-//  4. If every delay up to the window still dies, you die normally.
-//
-// Only early clicks can be fixed, since the press can only be moved later.
-// Only player 1's jump button is handled.
-
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -35,31 +21,42 @@ static int lookaheadTicks() {
 // ---------- state ----------
 
 struct AssistState {
-    int tick = 0;                         // our own physics tick counter
+    int tick = 0;                 // real physics ticks completed this attempt
 
-    Ref<CheckpointObject> snapshot = nullptr; // game state right before the press
-    int pressTick = -1;                   // tick of the original press
-    int holdTicks = -1;                   // how long the press was held (-1 = still held)
-    int delay = 0;                        // delay currently being tried
+    // Real input
+    bool pendingPress = false;    // a real press is waiting to be predicted
+    int realPressTick = -1;       // tick the real press arrived
+    int releaseHold = -1;         // hold length of the real press, once released
+    int lastHold = 6;             // last observed hold length, used to guess the next one
 
-    int fireTick = -1;                    // tick to inject the delayed press
-    int releaseTick = -1;                 // tick to inject the release
-    bool rollbackRequested = false;
-    bool injecting = false;               // true while we call handleButton ourselves
+    // Scheduled (possibly delayed) press/release in the real run
+    int delay = 0;
+    int fireTick = -1;            // tick to inject the press
+    int pressFireTick = -1;       // tick the press was actually injected
+    int releaseTick = -1;         // tick to inject the release
+
+    // Prediction
+    bool simulating = false;      // true while running off-screen trial ticks
+    bool simDied = false;
+    bool simDone = false;         // level completed during a trial
+    bool injecting = false;       // true while we call handleButton ourselves
 
     void clearPress() {
-        snapshot = nullptr;
-        pressTick = -1;
-        holdTicks = -1;
+        pendingPress = false;
+        realPressTick = -1;
+        releaseHold = -1;
         delay = 0;
         fireTick = -1;
+        pressFireTick = -1;
         releaseTick = -1;
-        rollbackRequested = false;
     }
 
     void reset() {
         clearPress();
         tick = 0;
+        simulating = false;
+        simDied = false;
+        simDone = false;
         injecting = false;
     }
 };
@@ -81,72 +78,119 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (s.injecting || !assistEnabled() || !isActivePlayLayer() || button != 1 || !isPlayer1) {
+        if (s.injecting || s.simulating || !assistEnabled() || !isActivePlayLayer()
+            || button != 1 || !isPlayer1) {
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
-
-        auto pl = PlayLayer::get();
 
         if (down) {
-            // A new real press replaces any assist still in progress.
+            // Hold the real press back; the next tick predicts when to fire it.
+            // A new press replaces anything still scheduled from an older one.
+            if (s.pressFireTick >= 0 || s.releaseTick >= 0) {
+                // Older press is still held in-game: release it first.
+                injectButton(this, false);
+            }
             s.clearPress();
-            s.snapshot = pl->createCheckpoint();
-            s.pressTick = s.tick;
+            s.pendingPress = true;
+            s.realPressTick = s.tick;
+            return;
+        }
+
+        // Release of a press we never tracked: pass it through.
+        if (s.realPressTick < 0) {
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
 
-        // Release
-        if (s.pressTick >= 0 && s.holdTicks < 0) {
-            if (s.fireTick >= 0) {
-                // The delayed press hasn't fired yet: release right after it does.
-                s.holdTicks = 1;
-                s.releaseTick = s.fireTick + 1;
-                return; // swallow the real release for now
+        int hold = std::max(1, s.tick - s.realPressTick);
+        s.lastHold = std::clamp(hold, 1, lookaheadTicks());
+
+        if (s.pressFireTick >= 0) {
+            // Press already fired: keep the same hold length, shifted by the delay.
+            int rt = s.pressFireTick + hold;
+            if (rt <= s.tick) {
+                s.clearPress();
+                return GJBaseGameLayer::handleButton(down, button, isPlayer1);
             }
-            s.holdTicks = std::max(1, s.tick - (s.pressTick + s.delay));
+            s.releaseTick = rt;
+            return;
         }
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+
+        // Press hasn't fired yet: release `hold` ticks after it does.
+        s.releaseHold = hold;
+    }
+
+    // Runs trial timelines off-screen and returns the first delay that survives.
+    // Nothing is drawn between these ticks, so the player never sees the trials.
+    int predictDelay(PlayLayer* pl, float dt) {
+        Ref<CheckpointObject> snap = pl->createCheckpoint();
+        if (!snap) return 0;
+
+        int window = assistWindow();
+        int look = lookaheadTicks();
+        int hold = s.releaseHold > 0 ? s.releaseHold : s.lastHold;
+
+        int chosen = 0;
+        s.simulating = true;
+
+        for (int d = 0; d <= window; ++d) {
+            s.simDied = false;
+            s.simDone = false;
+            bool held = false;
+
+            for (int t = 0; t < d + look && !s.simDied && !s.simDone; ++t) {
+                if (t == d) { injectButton(this, true); held = true; }
+                if (held && t == d + hold) { injectButton(this, false); held = false; }
+                GJBaseGameLayer::processCommands(dt, false, true);
+            }
+
+            if (held) injectButton(this, false);
+            pl->loadFromCheckpoint(snap);
+
+            if (!s.simDied) {
+                chosen = d;
+                break;
+            }
+        }
+
+        s.simulating = false;
+        s.simDied = false;
+        s.simDone = false;
+        // If every timing dies, fire on time and let the death happen normally.
+        return chosen;
     }
 
     // Called once per physics tick (240 per second).
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (!assistEnabled() || !isActivePlayLayer()) {
+        if (s.simulating || !assistEnabled() || !isActivePlayLayer()) {
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
 
         auto pl = PlayLayer::get();
 
-        // Do the rollback here rather than inside destroyPlayer,
-        // because restoring state in the middle of collision checks is unsafe.
-        if (s.rollbackRequested && s.snapshot) {
-            s.rollbackRequested = false;
-            pl->loadFromCheckpoint(s.snapshot);
-            s.tick = s.pressTick;
-            s.fireTick = s.pressTick + s.delay;
-            s.releaseTick = s.holdTicks >= 0 ? s.fireTick + s.holdTicks : -1;
+        if (s.pendingPress) {
+            s.pendingPress = false;
+            s.delay = predictDelay(pl, dt);
+            s.fireTick = s.tick + s.delay;
         }
 
         if (s.fireTick >= 0 && s.tick >= s.fireTick) {
             s.fireTick = -1;
             injectButton(this, true);
+            s.pressFireTick = s.tick;
+            if (s.releaseHold > 0) s.releaseTick = s.tick + s.releaseHold;
         }
+
         if (s.fireTick < 0 && s.releaseTick >= 0 && s.tick >= s.releaseTick) {
-            s.releaseTick = -1;
             injectButton(this, false);
+            s.clearPress();
         }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         s.tick++;
-
-        // Survived long enough after the press: stop tracking it.
-        if (s.pressTick >= 0 && !s.rollbackRequested
-            && s.tick - (s.pressTick + s.delay) > lookaheadTicks()) {
-            s.clearPress();
-        }
     }
 };
 
-// ---------- death, label and safe mode ----------
+// ---------- death, completion, label and safe mode ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
     struct Fields {
@@ -191,16 +235,21 @@ class $modify(AssistPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        // m_anticheatSpike is a fake death GD triggers on purpose; always let it through.
-        if (!assistEnabled() || obj == m_anticheatSpike || !s.snapshot
-            || s.pressTick < 0 || s.delay >= assistWindow()) {
-            return PlayLayer::destroyPlayer(player, obj);
+        if (s.simulating) {
+            // Death inside a trial timeline: record it, don't actually die.
+            s.simDied = true;
+            return;
         }
+        // Real deaths always go through. The assist only picks click timing.
+        PlayLayer::destroyPlayer(player, obj);
+    }
 
-        if (!s.rollbackRequested) {
-            s.delay++;
-            s.rollbackRequested = true;
+    void levelComplete() {
+        if (s.simulating) {
+            // Reaching the end during a trial counts as surviving.
+            s.simDone = true;
+            return;
         }
-        // Skip this death; the rollback happens at the start of the next tick.
+        PlayLayer::levelComplete();
     }
 };
