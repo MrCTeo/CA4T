@@ -1,4 +1,5 @@
 #include <Geode/Geode.hpp>
+#include <chrono>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
@@ -119,8 +120,41 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         s.releaseHold = hold;
     }
 
-    // Runs trial timelines off-screen and returns the first delay that survives.
-    // Nothing is drawn between these ticks, so the player never sees the trials.
+    // Runs one off-screen trial with the press delayed by `d` ticks.
+    // Returns the tick the player died on, or -1 if it survived `maxTicks`.
+    // Always restores the snapshot afterwards.
+    int runTrial(PlayLayer* pl, CheckpointObject* snap, float dt, int d, int hold,
+                 int maxTicks, std::chrono::steady_clock::time_point deadline, bool& outOfTime) {
+        s.simDied = false;
+        s.simDone = false;
+        bool held = false;
+        int deathTick = -1;
+
+        for (int t = 0; t < maxTicks; ++t) {
+            if (t == d) { injectButton(this, true); held = true; }
+            if (held && t == d + hold) { injectButton(this, false); held = false; }
+            // isLastTick = false: skips per-frame visual work the trial doesn't need.
+            GJBaseGameLayer::processCommands(dt, false, false);
+            if (s.simDied) { deathTick = t; break; }
+            if (s.simDone) break;
+            if ((t & 7) == 7 && std::chrono::steady_clock::now() > deadline) {
+                outOfTime = true;
+                break;
+            }
+        }
+
+        if (held) injectButton(this, false);
+        pl->loadFromCheckpoint(snap);
+        return deathTick;
+    }
+
+    // Picks when to actually send the press.
+    //
+    // Tries the click on tick 0, 1, 2, ... up to the window. For each one it simulates
+    // `lookahead` ticks after the click. The first tick where the click doesn't kill
+    // you is where the real click gets sent.
+    // If every tick dies, it sends the click on whichever tick survived longest.
+    // Nothing is drawn between trials, so none of this is visible.
     int predictDelay(PlayLayer* pl, float dt) {
         Ref<CheckpointObject> snap = pl->createCheckpoint();
         if (!snap) return 0;
@@ -129,33 +163,44 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         int look = lookaheadTicks();
         int hold = s.releaseHold > 0 ? s.releaseHold : s.lastHold;
 
-        int chosen = 0;
+        auto startTime = std::chrono::steady_clock::now();
+        auto deadline = startTime + std::chrono::milliseconds(8);
+        bool outOfTime = false;
+
+        int chosen = -1;
+        int bestDelay = 0;
+        int bestDeath = -1;
+        int tried = 0;
+
         s.simulating = true;
 
         for (int d = 0; d <= window; ++d) {
-            s.simDied = false;
-            s.simDone = false;
-            bool held = false;
+            ++tried;
+            int death = runTrial(pl, snap, dt, d, hold, d + look, deadline, outOfTime);
+            if (outOfTime) break;
 
-            for (int t = 0; t < d + look && !s.simDied && !s.simDone; ++t) {
-                if (t == d) { injectButton(this, true); held = true; }
-                if (held && t == d + hold) { injectButton(this, false); held = false; }
-                GJBaseGameLayer::processCommands(dt, false, true);
-            }
-
-            if (held) injectButton(this, false);
-            pl->loadFromCheckpoint(snap);
-
-            if (!s.simDied) {
+            if (death < 0) {           // this tick is safe
                 chosen = d;
                 break;
+            }
+            if (death > bestDeath) {   // remember the one that lived longest
+                bestDeath = death;
+                bestDelay = d;
             }
         }
 
         s.simulating = false;
         s.simDied = false;
         s.simDone = false;
-        // If every timing dies, fire on time and let the death happen normally.
+
+        bool foundSafe = chosen >= 0;
+        if (!foundSafe) chosen = bestDelay;
+
+        auto ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - startTime).count();
+        log::info("CA predict: sendOnTick=+{} trials={} foundSafe={} outOfTime={} time={:.2f}ms",
+                  chosen, tried, foundSafe, outOfTime, ms);
+
         return chosen;
     }
 
