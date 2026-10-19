@@ -19,10 +19,23 @@
     },
     "window": {
       "type": "int",
-      "name": "Search window (ticks)",
-      "description": "How many ticks ahead to search for a safe tick to send the click on. GD runs at 240 ticks per second, so 4 ticks is about 17 ms.",
+      "name": "Press search window (ticks)",
+      "description": "How many ticks a press may be moved later to avoid a death. GD runs at 240 ticks per second, so 4 ticks is about 17 ms.",
       "default": 4,
       "min": 1,
+      "max": 10,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "release-window": {
+      "type": "int",
+      "name": "Release search window (ticks)",
+      "description": "How many ticks a release may be moved later to avoid a death (you keep holding a bit longer). Releases can only be moved later, never earlier.",
+      "default": 4,
+      "min": 0,
       "max": 10,
       "control": {
         "slider": true,
