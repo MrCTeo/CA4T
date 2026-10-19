@@ -7,6 +7,9 @@
 
 using namespace geode::prelude;
 
+// Shown in the corner label so you can see which build is running.
+static constexpr char const* kBuildTag = "tracer-v3";
+
 // =====================================================================
 // How it works
 //
@@ -431,7 +434,7 @@ class $modify(AssistPlayLayer, PlayLayer) {
         bool on = assistEnabled();
         if (auto label = m_fields->label) {
             label->setVisible(on);
-            if (on) label->setString(fmt::format("CA {}t", assistWindow()).c_str());
+            if (on) label->setString(fmt::format("CA {}t {}", assistWindow(), kBuildTag).c_str());
         }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
