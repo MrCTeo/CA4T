@@ -8,7 +8,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v3";
+static constexpr char const* kBuildTag = "tracer-v4";
 
 // =====================================================================
 // How it works
@@ -20,7 +20,8 @@ static constexpr char const* kBuildTag = "tracer-v3";
 // If no tick in the window is safe, the input is sent on time, unchanged.
 //
 // Releases are checked too. On wave a release is just as deadly as a press,
-// so both directions are covered.
+// so both directions are covered. The tracer uses orbs, pads and gravity/size
+// portals like you would, and puts them back untouched after every check.
 //
 // The tracer never touches the real game: no snapshots, no rewinds, no wave
 // trail resets, no physics changes. Safe inputs go through with zero delay.
@@ -63,6 +64,12 @@ struct AssistState {
     int pressShift = 0;        // how late the last press was sent (applied to its release)
     bool injecting = false;
     double planMs = 0.0;
+
+    // Objects the tracer used (orbs, pads, portals): their activation is put back after each trace
+    struct Touched { GameObject* obj; bool p1; bool p2; };
+    std::vector<Touched> touched;
+    int diagOrbs = 0;                    // interactables the tracer touched
+    int diagFallbackDeaths = 0;          // deaths found by our own hitbox check
 
     // Diagnostics (last trace)
     int diagTicks = 0;
@@ -109,10 +116,105 @@ static void debugDiag() {
         debugLine("   SKIPPED: " + s.diagReason);
         return;
     }
-    debugLine(fmt::format("   ticks {} moved {:.0f},{:.0f} start-off {:.1f} coll {} objs {}{}",
+    debugLine(fmt::format("   ticks {} moved {:.0f},{:.0f} start-off {:.1f} coll {} objs {} orbs {}{}{}",
                           s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
-                          s.diagCollChecks, s.diagMaxObjs,
+                          s.diagCollChecks, s.diagMaxObjs, s.diagOrbs,
+                          s.diagFallbackDeaths ? " BACKUP-DEATH" : "",
                           s.diagTimedOut ? " TIMEOUT" : ""));
+}
+
+// ---------- object types ----------
+
+// Things that kill or block you.
+static bool isSolidOrHazard(GameObjectType t) {
+    switch (t) {
+        case GameObjectType::Solid:
+        case GameObjectType::Hazard:
+        case GameObjectType::AnimatedHazard:
+        case GameObjectType::Slope:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Things that only change the player who touches them. The tracer is allowed to
+// use these; their activation is restored after every trace.
+static bool isPlayerOnlyInteractable(GameObjectType t) {
+    switch (t) {
+        case GameObjectType::YellowJumpPad:
+        case GameObjectType::PinkJumpPad:
+        case GameObjectType::GravityPad:
+        case GameObjectType::RedJumpPad:
+        case GameObjectType::SpiderPad:
+        case GameObjectType::YellowJumpRing:
+        case GameObjectType::PinkJumpRing:
+        case GameObjectType::GravityRing:
+        case GameObjectType::RedJumpRing:
+        case GameObjectType::GreenRing:
+        case GameObjectType::DashRing:
+        case GameObjectType::GravityDashRing:
+        case GameObjectType::DropRing:
+        case GameObjectType::CustomRing:
+        case GameObjectType::InverseGravityPortal:
+        case GameObjectType::NormalGravityPortal:
+        case GameObjectType::GravityTogglePortal:
+        case GameObjectType::MiniSizePortal:
+        case GameObjectType::RegularSizePortal:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Things that change the whole level (camera, ground, both players).
+// The tracer can't safely go through these, so a trace stops when it reaches one.
+static bool isLevelChangingPortal(GameObjectType t) {
+    switch (t) {
+        case GameObjectType::ShipPortal:
+        case GameObjectType::CubePortal:
+        case GameObjectType::BallPortal:
+        case GameObjectType::UfoPortal:
+        case GameObjectType::WavePortal:
+        case GameObjectType::RobotPortal:
+        case GameObjectType::SpiderPortal:
+        case GameObjectType::SwingPortal:
+        case GameObjectType::DualPortal:
+        case GameObjectType::SoloPortal:
+        case GameObjectType::TeleportPortal:
+        case GameObjectType::SpiderOrb:
+        case GameObjectType::TeleportOrb:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void rememberTouched(GameObject* obj) {
+    for (auto& t : s.touched) if (t.obj == obj) return;
+    // If these two fields don't compile, check GameObject.hpp in your Geode
+    // bindings for the "has been activated" flags and use those names.
+    s.touched.push_back({obj, obj->m_hasBeenActivated, obj->m_hasBeenActivatedByPlayer2});
+}
+
+static void restoreTouched() {
+    for (auto& t : s.touched) {
+        t.obj->m_hasBeenActivated = t.p1;
+        t.obj->m_hasBeenActivatedByPlayer2 = t.p2;
+    }
+    s.diagOrbs = static_cast<int>(s.touched.size());
+    s.touched.clear();
+}
+
+// Removes anything the tracer spawned into the level (orb rings, pad effects).
+static void removeNewChildren(CCNode* node, unsigned int oldCount) {
+    if (!node) return;
+    auto children = node->getChildren();
+    if (!children) return;
+    while (children->count() > oldCount) {
+        auto child = static_cast<CCNode*>(children->lastObject());
+        child->removeFromParentAndCleanup(true);
+    }
 }
 
 // ---------- tracer ----------
@@ -171,7 +273,10 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     s.diagMovedY = 0.f;
     s.diagStartDiff = 0.f;
     s.diagTimedOut = false;
+    s.diagOrbs = 0;
+    s.diagFallbackDeaths = 0;
     s.diagReason.clear();
+    s.touched.clear();
 
     if (s.playerDt <= 0.f)  { s.diagReason = "no update dt"; return -1; }
     if (s.collideDt <= 0.f) { s.diagReason = "no collision dt"; return -1; }
@@ -180,6 +285,9 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     copyPlayerState(s.fake, pl->m_player1);
     auto startPos = s.fake->m_position;
     s.diagStartDiff = ccpDistance(startPos, pl->m_player1->m_position);
+
+    unsigned int objLayerCount = pl->m_objectLayer ? pl->m_objectLayer->getChildrenCount() : 0;
+    unsigned int plCount = pl->getChildrenCount();
 
     s.tracing = true;
     s.traceDied = false;
@@ -212,6 +320,11 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     if (held) s.fake->releaseButton(PlayerButton::Jump);
     s.diagMovedX = s.fake->m_position.x - startPos.x;
     s.diagMovedY = s.fake->m_position.y - startPos.y;
+
+    // Put the level back exactly as it was.
+    restoreTouched();
+    removeNewChildren(pl->m_objectLayer, objLayerCount);
+    removeNewChildren(pl, plCount);
 
     s.tracing = false;
     s.traceDied = false;
@@ -346,8 +459,11 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         return GJBaseGameLayer::checkCollisions(player, dt, ignoreDamage);
     }
 
-    // The tracer only collides with blocks, spikes and slopes, so it can never
-    // use orbs, pads, portals, coins or triggers in the real level.
+    // What the tracer collides with:
+    //  - blocks, spikes, slopes: normally, plus our own hitbox check as a backup
+    //  - orbs, pads, gravity/size portals: used normally, activation restored afterwards
+    //  - gamemode/dual/teleport portals, spider/teleport orbs: trace stops there
+    //  - everything else (coins, triggers, decoration): ignored
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
                                int count, float dt) {
         if (!s.tracing || player != s.fake || !objects) {
@@ -356,24 +472,48 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
 
         static gd::vector<GameObject*> kept;
         kept.clear();
+        auto playerRect = player->getObjectRect();
         int n = std::min(count, static_cast<int>(objects->size()));
+
         for (int i = 0; i < n; ++i) {
             auto obj = (*objects)[i];
             if (!obj) continue;
-            switch (obj->m_objectType) {
-                case GameObjectType::Solid:
-                case GameObjectType::Hazard:
-                case GameObjectType::AnimatedHazard:
-                case GameObjectType::Slope:
-                    kept.push_back(obj);
-                    break;
-                default:
-                    break;
+            auto type = obj->m_objectType;
+
+            if (isSolidOrHazard(type)) {
+                kept.push_back(obj);
+            } else if (isPlayerOnlyInteractable(type)) {
+                rememberTouched(obj);
+                kept.push_back(obj);
+            } else if (isLevelChangingPortal(type)) {
+                if (playerRect.intersectsRect(obj->getObjectRect())) s.traceDone = true;
             }
         }
+
         s.diagCollChecks++;
         s.diagMaxObjs = std::max(s.diagMaxObjs, static_cast<int>(kept.size()));
         GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
+
+        // Backup death check, in case the game doesn't report the tracer's death:
+        // spikes kill on the full hitbox, blocks kill on the small inner hitbox.
+        if (!s.traceDied) {
+            auto outer = player->getObjectRect();
+            auto inner = player->getObjectRect(0.3f, 0.3f);
+            for (auto obj : kept) {
+                auto type = obj->m_objectType;
+                bool hit = false;
+                if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) {
+                    hit = outer.intersectsRect(obj->getObjectRect());
+                } else if (type == GameObjectType::Solid) {
+                    hit = inner.intersectsRect(obj->getObjectRect());
+                }
+                if (hit) {
+                    s.traceDied = true;
+                    s.diagFallbackDeaths++;
+                    break;
+                }
+            }
+        }
     }
 };
 
