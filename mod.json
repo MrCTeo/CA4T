@@ -5,10 +5,10 @@
     "android": "2.2081",
     "mac": "2.2081"
   },
-  "id": "MrCTeo.click-assist",
+  "id": "yourname.click-assist",
   "name": "Click Assist (Practice)",
   "version": "v0.1.0",
-  "developer": "MrCTeo",
+  "developer": "YourName",
   "description": "Practice aid: if a click would kill you, sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
   "settings": {
     "enabled": {
