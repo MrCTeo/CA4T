@@ -8,7 +8,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v4";
+static constexpr char const* kBuildTag = "tracer-v4b";
 
 // =====================================================================
 // How it works
@@ -66,7 +66,7 @@ struct AssistState {
     double planMs = 0.0;
 
     // Objects the tracer used (orbs, pads, portals): their activation is put back after each trace
-    struct Touched { GameObject* obj; bool p1; bool p2; };
+    struct Touched { GameObject* obj; bool activated; };
     std::vector<Touched> touched;
     int diagOrbs = 0;                    // interactables the tracer touched
     int diagFallbackDeaths = 0;          // deaths found by our own hitbox check
@@ -192,15 +192,12 @@ static bool isLevelChangingPortal(GameObjectType t) {
 
 static void rememberTouched(GameObject* obj) {
     for (auto& t : s.touched) if (t.obj == obj) return;
-    // If these two fields don't compile, check GameObject.hpp in your Geode
-    // bindings for the "has been activated" flags and use those names.
-    s.touched.push_back({obj, obj->m_hasBeenActivated, obj->m_hasBeenActivatedByPlayer2});
+    s.touched.push_back({obj, obj->m_isActivated});
 }
 
 static void restoreTouched() {
     for (auto& t : s.touched) {
-        t.obj->m_hasBeenActivated = t.p1;
-        t.obj->m_hasBeenActivatedByPlayer2 = t.p2;
+        t.obj->m_isActivated = t.activated;
     }
     s.diagOrbs = static_cast<int>(s.touched.size());
     s.touched.clear();
