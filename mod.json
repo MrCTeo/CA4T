@@ -9,7 +9,7 @@
   "name": "Click Assist (Practice)",
   "version": "v0.1.0",
   "developer": "YourName",
-  "description": "Practice aid: if a click would kill you, sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
+  "description": "Practice aid: if a click would kill you, an invisible tracer finds the first safe tick within the next few ticks and sends the click there. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
   "settings": {
     "enabled": {
       "type": "bool",
@@ -42,6 +42,12 @@
         "arrows": true,
         "input": true
       }
+    },
+    "debug": {
+      "type": "bool",
+      "name": "Debug panel",
+      "description": "Shows what the assist decides on every click in the top-left corner: whether the click was safe, which tick it was sent on, and how long the check took.",
+      "default": false
     }
   }
 }
