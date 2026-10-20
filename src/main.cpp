@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v17";
+static constexpr char const* kBuildTag = "tracer-v18";
 
 // =====================================================================
 // How it works
@@ -326,7 +326,10 @@ static bool ensureTracer(PlayLayer* pl) {
     hidden->setVisible(false);
     pl->addChild(hidden, -1000);
 
-    auto fake = PlayerObject::create(1, 1, pl, hidden, false);
+    // The last argument tells GD this player belongs to a real level. Players
+    // created with `false` (like the ones in the main menu) don't run their own
+    // physics, which is why the tracer never moved.
+    auto fake = PlayerObject::create(1, 1, pl, hidden, true);
     if (!fake) return false;
     // Not hidden itself: GD may skip updating a hidden player. Its parent layer
     // is hidden, so it's still never drawn.
