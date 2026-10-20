@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v14";
+static constexpr char const* kBuildTag = "tracer-v16";
 
 // =====================================================================
 // How it works
@@ -72,6 +72,8 @@ struct AssistState {
     int prevTickNum = -1000;
     float dtScale = 0.f;                 // 0 = not calibrated yet
     bool frozen = false;                 // tracer doesn't move at any timestep
+    std::string frozenInfo;
+    std::vector<GameObject*> lastKept;   // objects near the tracer this step
 
     // Inputs
     std::deque<PendingInput> queue;
@@ -122,6 +124,7 @@ struct AssistState {
         lines.clear();
         dtScale = 0.f;
         frozen = false;
+        frozenInfo.clear();
         prevTickNum = -1000;
         tracks.clear();
         movedForTrace.clear();
@@ -324,7 +327,8 @@ static bool ensureTracer(PlayLayer* pl) {
 
     auto fake = PlayerObject::create(1, 1, pl, hidden, false);
     if (!fake) return false;
-    fake->setVisible(false);
+    // Not hidden itself: GD may skip updating a hidden player. Its parent layer
+    // is hidden, so it's still never drawn.
     hidden->addChild(fake);
 
     s.fake = fake;
@@ -357,27 +361,103 @@ static void calibrateTracer(PlayLayer* pl) {
     if (s.dtScale > 0.f || s.frozen) return;
     if (s.realDx < 0.01f || s.playerDt <= 0.f) return;   // need you moving first
 
-    auto measure = [&](float scale) {
+    // What changed on the tracer after one update, measured several ways:
+    // physics position, drawn position and vertical speed.
+    float lastDpx = 0.f, lastDnx = 0.f, lastDy = 0.f, lastDvy = 0.f;
+    auto measure = [&](float scale, bool useNodePos) {
         copyPlayerState(s.fake, pl->m_player1);
-        float x0 = s.fake->m_position.x;
+        CCPoint p0 = s.fake->m_position;
+        CCPoint n0 = s.fake->getPosition();
+        double vy0 = s.fake->m_yVelocity;
         s.tracing = true;
         s.fake->update(s.playerDt * scale);
         s.tracing = false;
-        return s.fake->m_position.x - x0;
+        lastDpx = s.fake->m_position.x - p0.x;
+        lastDnx = s.fake->getPositionX() - n0.x;
+        lastDy  = s.fake->m_position.y - p0.y;
+        lastDvy = static_cast<float>(s.fake->m_yVelocity - vy0);
+        return useNodePos ? lastDnx : lastDpx;
     };
 
-    // Try the copied timestep first, then the usual unit conversions.
-    for (float scale : {1.f, 60.f, 240.f, 1.f / 60.f}) {
-        float dx = measure(scale);
-        if (std::abs(dx) < 1e-5f) continue;
-        // Movement is linear in the timestep, so this lands exactly on your speed.
-        s.dtScale = scale * (s.realDx / dx);
-        log::info("[CA] calibrated: realDx {:.4f} tracerDx {:.6f} at x{} -> dt scale {:.4f}",
-                  s.realDx, dx, scale, s.dtScale);
-        return;
+    for (bool nodePos : {false, true}) {
+        for (float scale : {1.f, 60.f, 240.f, 1.f / 60.f}) {
+            float dx = measure(scale, nodePos);
+            if (std::abs(dx) < 1e-5f) continue;
+            s.dtScale = scale * (s.realDx / dx);
+            log::info("[CA] calibrated: realDx {:.4f} tracerDx {:.6f} at x{} ({}) -> dt scale {:.4f}",
+                      s.realDx, dx, scale, nodePos ? "node pos" : "m_position", s.dtScale);
+            return;
+        }
     }
+
     s.frozen = true;
-    log::info("[CA] calibration failed: tracer does not move at any timestep");
+    s.frozenInfo = fmt::format("realDx {:.3f} dt {:.5f} | dpos {:.4f} dnode {:.4f} dy {:.4f} dvy {:.4f}",
+                               s.realDx, s.playerDt, lastDpx, lastDnx, lastDy, lastDvy);
+    log::info("[CA] calibration failed: {}", s.frozenInfo);
+}
+
+
+// ---------- built-in wave physics (used when GD won't move the tracer) ----------
+//
+// Wave is simple enough to simulate exactly: it moves forward at your speed and
+// goes diagonally up while held, down while released (twice as steep in mini).
+// Floors and ceilings are slid along; hitting a block side or a spike kills.
+
+static void setTracerPos(CCPoint p) {
+    s.fake->m_position = p;
+    s.fake->setPosition(p);
+}
+
+static void waveStep(bool held) {
+    CCPoint p = s.fake->m_position;
+    float slope = s.fake->m_vehicleSize < 0.9f ? 2.f : 1.f;
+    float dir = (held ? 1.f : -1.f) * (s.fake->m_isUpsideDown ? -1.f : 1.f);
+    p.x += s.realDx;
+    p.y += dir * slope * s.realDx;
+    setTracerPos(p);
+}
+
+// The tracer's hitbox: your real hitbox, moved to where the tracer is. That way
+// it's always exactly your size (mini, wave hitbox) whatever the tracer copied.
+static PlayerObject* s_realPlayer = nullptr;
+static CCRect tracerRect() {
+    auto r = s_realPlayer->getObjectRect();
+    CCPoint off = s.fake->m_position - s_realPlayer->m_position;
+    r.origin = r.origin + off;
+    return r;
+}
+
+// Returns true if the tracer dies against the objects near it.
+static bool waveCollide(CCRect const& before) {
+    for (auto obj : s.lastKept) {
+        auto type = obj->m_objectType;
+        auto r = obj->getObjectRect();
+        auto outer = tracerRect();
+        if (!outer.intersectsRect(r)) continue;
+
+        if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) {
+            return true;
+        }
+        if (type == GameObjectType::Solid) {
+            float top = r.getMaxY(), bottom = r.getMinY();
+            if (before.getMinY() >= top - 0.5f) {
+                // Came from above: slide along the top.
+                CCPoint p = s.fake->m_position;
+                p.y += top - outer.getMinY();
+                setTracerPos(p);
+                continue;
+            }
+            if (before.getMaxY() <= bottom + 0.5f) {
+                // Came from below: slide along the bottom.
+                CCPoint p = s.fake->m_position;
+                p.y -= outer.getMaxY() - bottom;
+                setTracerPos(p);
+                continue;
+            }
+            return true;   // hit the side of a block
+        }
+    }
+    return false;
 }
 
 
@@ -403,13 +483,18 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     if (s.collideDt <= 0.f) { s.diagReason = "no collision dt"; return -1; }
     if (!ensureTracer(pl))  { s.diagReason = "no tracer"; return -1; }
     calibrateTracer(pl);
-    if (s.frozen)           { s.diagReason = "tracer does not move"; return -1; }
-    if (s.dtScale <= 0.f) {
+    // If GD won't move the tracer, wave falls back to the built-in wave physics.
+    bool builtinWave = s.frozen && pl->m_player1->m_isDart;
+    if (s.frozen && !builtinWave) {
+        s.diagReason = "tracer does not move (only wave works for now): " + s.frozenInfo;
+        return -1;
+    }
+    if (!builtinWave && s.dtScale <= 0.f) {
         s.diagReason = fmt::format("calibrating (realDx {:.4f}, dt {:.5f})", s.realDx, s.playerDt);
         return -1;
     }
-    float stepDt = s.playerDt * s.dtScale;
-    float collDt = s.collideDt * s.dtScale;
+    float stepDt = s.playerDt * (builtinWave ? 1.f : s.dtScale);
+    float collDt = s.collideDt * (builtinWave ? 1.f : s.dtScale);
 
     copyPlayerState(s.fake, pl->m_player1);
     auto startPos = s.fake->m_position;
@@ -444,8 +529,20 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
             held = down;
         }
         s.traceAhead = t + 1;
-        s.fake->update(stepDt);
-        pl->checkCollisions(s.fake, collDt, false);
+        if (builtinWave) {
+            s_realPlayer = pl->m_player1;
+            CCRect before = tracerRect();
+            waveStep(held);
+            s.lastKept.clear();
+            pl->checkCollisions(s.fake, collDt, false);   // orbs, portals, moving objects
+            if (!s.traceDied && waveCollide(before)) {
+                s.traceDied = true;
+                s.diagFallbackDeaths++;
+            }
+        } else {
+            s.fake->update(stepDt);
+            pl->checkCollisions(s.fake, collDt, false);
+        }
         s.diagTicks = t + 1;
 
         if (s.traceDied) { death = t; break; }
@@ -724,6 +821,9 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         s.diagCollChecks++;
         s.diagMaxObjs = std::max(s.diagMaxObjs, static_cast<int>(kept.size()));
         GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
+
+        s.lastKept.assign(kept.begin(), kept.end());
+        if (s.frozen) return;   // built-in wave physics does its own collision
 
         // Backup death check, in case the game doesn't report the tracer's death:
         // spikes kill on the full hitbox, blocks kill on the small inner hitbox.
