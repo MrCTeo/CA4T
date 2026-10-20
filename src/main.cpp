@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v12";
+static constexpr char const* kBuildTag = "tracer-v13";
 
 // =====================================================================
 // How it works
@@ -65,6 +65,11 @@ struct AssistState {
     bool traceDone = false;
     float playerDt = 0.f;
     float collideDt = 0.f;
+    // Timestep calibration: how far you really move per tick, and the factor
+    // the tracer's timestep needs so it moves the same distance.
+    float realDx = 0.f;
+    float dtScale = 0.f;                 // 0 = not calibrated yet
+    bool frozen = false;                 // tracer doesn't move at any timestep
 
     // Inputs
     std::deque<PendingInput> queue;
@@ -113,6 +118,8 @@ struct AssistState {
         pressShift = 0;
         injecting = false;
         lines.clear();
+        dtScale = 0.f;
+        frozen = false;
         tracks.clear();
         movedForTrace.clear();
     }
@@ -142,8 +149,8 @@ static void debugDiag() {
               s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
               s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers, s.diagFallbackDeaths,
               s.diagTimedOut, s.playerDt, s.collideDt);
-    debugLine(fmt::format("   ticks {} moved {:.3f},{:.3f} dt {:.5f}/{:.5f} coll {} objs {} orbs {} movers {}{}{}",
-                          s.diagTicks, s.diagMovedX, s.diagMovedY, s.playerDt, s.collideDt,
+    debugLine(fmt::format("   ticks {} moved {:.3f},{:.3f} dt {:.5f}/{:.5f} x{:.2f} coll {} objs {} orbs {} movers {}{}{}",
+                          s.diagTicks, s.diagMovedX, s.diagMovedY, s.playerDt, s.collideDt, s.dtScale,
                           s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers,
                           s.diagFallbackDeaths ? " BACKUP-DEATH" : "",
                           s.diagTimedOut ? " TIMEOUT" : ""));
@@ -340,6 +347,37 @@ static void copyPlayerState(PlayerObject* dst, PlayerObject* src) {
     dst->setPosition(src->getPosition());
 }
 
+// The tracer wasn't moving: the timestep it copied from the game was in the
+// wrong units for it. This measures how far you really move per tick and finds
+// the timestep that makes the tracer move the same distance.
+static void calibrateTracer(PlayLayer* pl) {
+    if (s.dtScale > 0.f || s.frozen) return;
+    if (s.realDx < 0.01f || s.playerDt <= 0.f) return;   // need you moving first
+
+    auto measure = [&](float scale) {
+        copyPlayerState(s.fake, pl->m_player1);
+        float x0 = s.fake->m_position.x;
+        s.tracing = true;
+        s.fake->update(s.playerDt * scale);
+        s.tracing = false;
+        return s.fake->m_position.x - x0;
+    };
+
+    // Try the copied timestep first, then the usual unit conversions.
+    for (float scale : {1.f, 60.f, 240.f, 1.f / 60.f}) {
+        float dx = measure(scale);
+        if (std::abs(dx) < 1e-5f) continue;
+        // Movement is linear in the timestep, so this lands exactly on your speed.
+        s.dtScale = scale * (s.realDx / dx);
+        log::info("[CA] calibrated: realDx {:.4f} tracerDx {:.6f} at x{} -> dt scale {:.4f}",
+                  s.realDx, dx, scale, s.dtScale);
+        return;
+    }
+    s.frozen = true;
+    log::info("[CA] calibration failed: tracer does not move at any timestep");
+}
+
+
 // Flies the tracer: keeps the current button state for `delay` ticks, then
 // applies the input (`down`), then keeps that state until `maxTicks`.
 // Returns the tick it died on, or -1 if it survived.
@@ -361,6 +399,11 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     if (s.playerDt <= 0.f)  { s.diagReason = "no update dt"; return -1; }
     if (s.collideDt <= 0.f) { s.diagReason = "no collision dt"; return -1; }
     if (!ensureTracer(pl))  { s.diagReason = "no tracer"; return -1; }
+    calibrateTracer(pl);
+    if (s.frozen)           { s.diagReason = "tracer does not move"; return -1; }
+    if (s.dtScale <= 0.f)   { s.diagReason = "calibrating (move first)"; return -1; }
+    float stepDt = s.playerDt * s.dtScale;
+    float collDt = s.collideDt * s.dtScale;
 
     copyPlayerState(s.fake, pl->m_player1);
     auto startPos = s.fake->m_position;
@@ -384,7 +427,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     // pass at your current position first lets the tracer "touch" the orb you're
     // in, exactly like you already have.
     s.traceAhead = 0;
-    pl->checkCollisions(s.fake, s.collideDt, false);
+    pl->checkCollisions(s.fake, collDt, false);
     int death = -1;
     if (s.traceDied) death = 0;   // already touching something deadly
 
@@ -395,8 +438,8 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
             held = down;
         }
         s.traceAhead = t + 1;
-        s.fake->update(s.playerDt);
-        pl->checkCollisions(s.fake, s.collideDt, false);
+        s.fake->update(stepDt);
+        pl->checkCollisions(s.fake, collDt, false);
         s.diagTicks = t + 1;
 
         if (s.traceDied) { death = t; break; }
@@ -445,7 +488,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     }
 
     auto start = std::chrono::steady_clock::now();
-    auto deadline = start + std::chrono::microseconds(2000);
+    auto deadline = start + std::chrono::microseconds(4000);
 
     int look = pl->m_player1->m_isDart ? waveLookahead() : lookaheadTicks();
     // Presses and releases each have their own search window.
@@ -611,7 +654,12 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
         processQueue();
+        float x0 = m_player1 ? m_player1->m_position.x : 0.f;
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        if (m_player1) {
+            float dx = m_player1->m_position.x - x0;
+            if (dx > 0.01f && dx < 100.f) s.realDx = dx;   // ignore resets/teleports
+        }
         s.tick++;
     }
 
