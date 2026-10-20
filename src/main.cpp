@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v16";
+static constexpr char const* kBuildTag = "tracer-v17";
 
 // =====================================================================
 // How it works
@@ -39,6 +39,7 @@ static bool waveSpamFix()    { return Mod::get()->getSettingValue<bool>("wave-sp
 static int  spamGap()        { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-gap")); }
 static int  spamMaxDelay()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-max-delay")); }
 static bool predictMoving()  { return Mod::get()->getSettingValue<bool>("predict-moving"); }
+static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
 
 // ---------- state ----------
@@ -588,6 +589,16 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
         in.firstDeath = -1;
         s.planMs = 0.0;
         return 0;
+    }
+
+    // Test setting: delay every press by a fixed amount, no prediction at all.
+    // Used to check that holding back inputs works by itself.
+    if (forceDelay() > 0 && in.down) {
+        in.firstDeath = 0;
+        in.foundSafe = true;
+        s.planMs = 0.0;
+        s.diagReason = "forced delay test";
+        return forceDelay();
     }
 
     auto start = std::chrono::steady_clock::now();
