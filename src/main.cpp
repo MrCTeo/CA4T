@@ -8,7 +8,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v6";
+static constexpr char const* kBuildTag = "tracer-v8";
 
 // =====================================================================
 // How it works
@@ -45,6 +45,7 @@ struct PendingInput {
     int fireTick = -1;       // -1 = not planned yet
     int firstDeath = -1;     // where the on-time input would have died
     bool foundSafe = true;
+    bool skipped = false;    // not checked (gamemode not assisted)
 };
 
 struct AssistState {
@@ -338,7 +339,25 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
 
 // Finds the first tick (+0 .. +window) where this input doesn't kill you.
 // Returns that delay, or 0 if none is safe (input is sent on time).
+// Gamemodes the assist leaves alone:
+//  - ship and swing: nothing is checked
+//  - robot: presses are checked, releases are not
+static bool assistOff(PlayerObject* p, bool down) {
+    if (p->m_isShip || p->m_isSwing) return true;
+    if (p->m_isRobot && !down) return true;
+    return false;
+}
+
 static int planInput(PlayLayer* pl, PendingInput& in) {
+    // Not assisted in this gamemode: the input goes through on time.
+    if (assistOff(pl->m_player1, in.down)) {
+        in.skipped = true;
+        in.foundSafe = true;
+        in.firstDeath = -1;
+        s.planMs = 0.0;
+        return 0;
+    }
+
     auto start = std::chrono::steady_clock::now();
     auto deadline = start + std::chrono::microseconds(2000);
 
@@ -362,6 +381,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
 }
 
 static void logDecision(PendingInput const& in, int delay) {
+    if (in.skipped) return;
     char const* what = in.down ? "press  " : "release";
     if (in.firstDeath < 0) {
         debugLine(fmt::format("{} +0 safe  ({:.2f}ms)", what, s.planMs));
@@ -397,6 +417,18 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
 
         auto pl = PlayLayer::get();
         if (pl->m_player1->m_isPlatformer) {
+            return GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        }
+
+        // Not assisted in this gamemode (ship, swing, robot releases). If nothing
+        // is waiting, the input goes straight through; otherwise it queues
+        // behind the waiting ones to keep the order.
+        // A robot release after a delayed press still waits for its shift, so
+        // the jump keeps the height you played; it just isn't checked.
+        bool needsShift = !down && s.pressShift > 0;
+        if (assistOff(pl->m_player1, down) && s.queue.empty() && !needsShift) {
+            s.heldInGame = down;
+            s.pressShift = 0;
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
 
