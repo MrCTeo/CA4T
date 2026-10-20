@@ -20,10 +20,10 @@
     "window": {
       "type": "int",
       "name": "Press search window (ticks)",
-      "description": "How many ticks a press may be moved later to avoid a death. GD runs at 240 ticks per second, so 4 ticks is about 17 ms.",
+      "description": "How many ticks a press may be moved later to avoid a death (up to 32). GD runs at 240 ticks per second, so 4 ticks is about 17 ms and 32 ticks about 133 ms.",
       "default": 4,
       "min": 1,
-      "max": 10,
+      "max": 32,
       "control": {
         "slider": true,
         "arrows": true,
@@ -33,10 +33,10 @@
     "release-window": {
       "type": "int",
       "name": "Release search window (ticks)",
-      "description": "How many ticks a release may be moved later to avoid a death (you keep holding a bit longer). Releases can only be moved later, never earlier.",
+      "description": "How many ticks a release may be moved later to avoid a death (up to 32), meaning you keep holding a bit longer. Releases can only be moved later, never earlier.",
       "default": 4,
       "min": 0,
-      "max": 10,
+      "max": 32,
       "control": {
         "slider": true,
         "arrows": true,
@@ -49,7 +49,7 @@
       "description": "How many ticks after a click it must survive for that tick to count as safe. Keep this short (15-30) so later obstacles that need another click do not count.",
       "default": 20,
       "min": 5,
-      "max": 120,
+      "max": 360,
       "control": {
         "slider": true,
         "arrows": true,
@@ -62,7 +62,7 @@
       "description": "Safety check used while you're in wave. Wave inputs come fast, so this is shorter: an input only has to stay safe until your next one usually arrives.",
       "default": 10,
       "min": 3,
-      "max": 40,
+      "max": 360,
       "control": {
         "slider": true,
         "arrows": true,
