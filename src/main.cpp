@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v22";
+static constexpr char const* kBuildTag = "tracer-v23";
 
 // =====================================================================
 // How it works
@@ -101,9 +101,19 @@ struct AssistState {
 
     // Moving objects: positions of objects near you are tracked every real
     // tick, so the tracer can move them ahead in time while it predicts.
-    struct Track { CCPoint lastPos; CCPoint vel; int lastTick = -1000; };
+    struct Track {
+        CCPoint lastPos;
+        CCPoint vel;                 // units per tick
+        CCPoint acc;                 // change of vel per tick (easing, speeding up, slowing down)
+        float lastRot = 0.f;
+        float rotVel = 0.f;          // degrees per tick
+        int lastTick = -1000;
+        int samples = 0;
+    };
     std::unordered_map<GameObject*, Track> tracks;
-    std::unordered_map<GameObject*, CCPoint> movedForTrace;   // original positions
+    struct Saved { CCPoint pos; float rot; };
+    std::unordered_map<GameObject*, Saved> movedForTrace;     // original positions/rotations
+    bool scouting = false;               // looking ahead for objects, not predicting
     int traceAhead = 0;                  // ticks into the future the tracer is at
     int diagMovers = 0;
 
@@ -266,7 +276,8 @@ static void removeNewChildren(CCNode* node, unsigned int oldCount) {
 
 // ---------- moving objects ----------
 
-// Called with the objects near the real player every tick.
+// Records where objects are right now and works out how they move:
+// speed, acceleration (for eased moves) and rotation speed.
 static void trackObjects(gd::vector<GameObject*>* objects, int n) {
     for (int i = 0; i < n; ++i) {
         auto obj = (*objects)[i];
@@ -274,15 +285,28 @@ static void trackObjects(gd::vector<GameObject*>* objects, int n) {
         auto& tr = s.tracks[obj];
         if (tr.lastTick == s.tick) continue;          // already seen this tick
         CCPoint pos = obj->getPosition();
+        float rot = obj->getRotation();
         int gap = s.tick - tr.lastTick;
-        if (gap >= 1 && gap <= 8) {
-            CCPoint v = (pos - tr.lastPos) / static_cast<float>(gap);
-            // Smooth a little so one odd frame doesn't throw the prediction off.
-            tr.vel = gap == 1 ? (tr.vel * 0.3f + v * 0.7f) : v;
+        if (gap >= 1 && gap <= 8 && tr.samples > 0) {
+            float g = static_cast<float>(gap);
+            CCPoint v = (pos - tr.lastPos) / g;
+            float rv = (rot - tr.lastRot) / g;
+            if (tr.samples >= 2) {
+                CCPoint a = (v - tr.vel) / g;
+                tr.acc = tr.acc * 0.5f + a * 0.5f;
+            }
+            // Light smoothing so one odd frame doesn't throw the prediction off.
+            tr.vel = tr.vel * 0.25f + v * 0.75f;
+            tr.rotVel = tr.rotVel * 0.25f + rv * 0.75f;
+            tr.samples++;
         } else {
             tr.vel = CCPointZero;
+            tr.acc = CCPointZero;
+            tr.rotVel = 0.f;
+            tr.samples = 1;
         }
         tr.lastPos = pos;
+        tr.lastRot = rot;
         tr.lastTick = s.tick;
     }
     // Forget objects that haven't been near you for a while.
@@ -294,29 +318,46 @@ static void trackObjects(gd::vector<GameObject*>* objects, int n) {
     }
 }
 
-// Moves an object to where it will be `ahead` ticks from now (tracer only).
+// Puts an object where it will be `ahead` ticks from now (tracer only):
+// position from speed + acceleration, angle from rotation speed.
 static void moveAhead(GameObject* obj, int ahead) {
     auto it = s.tracks.find(obj);
     if (it == s.tracks.end()) return;
     auto& tr = it->second;
-    if (s.tick - tr.lastTick > 2) return;              // no fresh data
-    if (std::abs(tr.vel.x) < 0.001f && std::abs(tr.vel.y) < 0.001f) return;
+    if (tr.samples < 2 || s.tick - tr.lastTick > 6) return;    // no fresh data
+    bool moving = std::abs(tr.vel.x) > 0.001f || std::abs(tr.vel.y) > 0.001f
+               || std::abs(tr.acc.x) > 0.0005f || std::abs(tr.acc.y) > 0.0005f;
+    bool rotating = std::abs(tr.rotVel) > 0.01f;
+    if (!moving && !rotating) return;
 
     auto saved = s.movedForTrace.find(obj);
-    CCPoint origin;
     if (saved == s.movedForTrace.end()) {
-        origin = obj->getPosition();
-        s.movedForTrace[obj] = origin;
-    } else {
-        origin = saved->second;
+        // Remember the real position/angle once, to put it back after the trace.
+        s.movedForTrace[obj] = AssistState::Saved{obj->getPosition(), obj->getRotation()};
     }
-    obj->setPosition(origin + tr.vel * static_cast<float>(ahead));
+
+    // Data is from tr.lastTick; predict from there to `ahead` ticks after now.
+    float t = static_cast<float>(ahead + (s.tick - tr.lastTick));
+    CCPoint base = tr.lastPos;
+    CCPoint byVel = tr.vel * t;
+    CCPoint byAcc = tr.acc * (0.5f * t * t);
+    // Acceleration is only trusted up to the size of the move itself, so a noisy
+    // reading can't fling an object across the screen.
+    float velLen = ccpLength(byVel) + 2.f;
+    float accLen = ccpLength(byAcc);
+    if (accLen > velLen) byAcc = byAcc * (velLen / accLen);
+
+    if (moving) obj->setPosition(base + byVel + byAcc);
+    if (rotating) obj->setRotation(tr.lastRot + tr.rotVel * t);
 }
 
-// Puts every object the tracer moved back where it really is.
+// Puts every object the tracer moved back exactly where it really is.
 static void restoreMoved() {
     s.diagMovers = static_cast<int>(s.movedForTrace.size());
-    for (auto& [obj, pos] : s.movedForTrace) obj->setPosition(pos);
+    for (auto& [obj, sv] : s.movedForTrace) {
+        obj->setPosition(sv.pos);
+        obj->setRotation(sv.rot);
+    }
     s.movedForTrace.clear();
 }
 
@@ -350,8 +391,53 @@ static bool ensureTracer(PlayLayer* pl) {
     return true;
 }
 
+// Copies a field only if it exists in your GD version's bindings, so a guessed
+// field name can never break the build.
+#define CA_COPY_IF_EXISTS(dst, src, field) \
+    [](auto* d, auto* s2) { if constexpr (requires { d->field = s2->field; }) d->field = s2->field; }(dst, src)
+#define CA_HAS_FIELD(type, field) \
+    ([](auto* d) { return requires { d->field; }; }(static_cast<type*>(nullptr)))
+
+// True if the tracer can copy your exact button/orb-buffer state, instead of
+// pretending you just pressed.
+static constexpr bool kCopiesHoldState = CA_HAS_FIELD(PlayerObject, m_holdingButtons);
+
 static void copyPlayerState(PlayerObject* dst, PlayerObject* src) {
     dst->copyAttributes(src);
+
+    // Button and orb state: whether you're holding, whether a click is buffered,
+    // which orbs/pads you're touching or already used. This is what decides if
+    // an orb fires, so the tracer has to match you exactly.
+    CA_COPY_IF_EXISTS(dst, src, m_holdingButtons);
+    CA_COPY_IF_EXISTS(dst, src, m_jumpBuffered);
+    CA_COPY_IF_EXISTS(dst, src, m_stateJumpBuffered);
+    CA_COPY_IF_EXISTS(dst, src, m_wasJumpBuffered);
+    CA_COPY_IF_EXISTS(dst, src, m_hasJustHeld);
+    CA_COPY_IF_EXISTS(dst, src, m_hasJustHeld2);
+    CA_COPY_IF_EXISTS(dst, src, m_isHolding);
+    CA_COPY_IF_EXISTS(dst, src, m_isHolding2);
+    CA_COPY_IF_EXISTS(dst, src, m_stateRingJump);
+    CA_COPY_IF_EXISTS(dst, src, m_stateRingJump2);
+    CA_COPY_IF_EXISTS(dst, src, m_touchedRings);
+    CA_COPY_IF_EXISTS(dst, src, m_ringRelatedSet);
+    CA_COPY_IF_EXISTS(dst, src, m_touchedPad);
+
+    // Movement state used by jumps, slopes, dashes and gravity.
+    CA_COPY_IF_EXISTS(dst, src, m_isDashing);
+    CA_COPY_IF_EXISTS(dst, src, m_dashX);
+    CA_COPY_IF_EXISTS(dst, src, m_dashY);
+    CA_COPY_IF_EXISTS(dst, src, m_dashAngle);
+    CA_COPY_IF_EXISTS(dst, src, m_isSliding);
+    CA_COPY_IF_EXISTS(dst, src, m_isRising);
+    CA_COPY_IF_EXISTS(dst, src, m_isOnSlope);
+    CA_COPY_IF_EXISTS(dst, src, m_wasOnSlope);
+    CA_COPY_IF_EXISTS(dst, src, m_gravityMod);
+    CA_COPY_IF_EXISTS(dst, src, m_gravity);
+    CA_COPY_IF_EXISTS(dst, src, m_isLocked);
+    CA_COPY_IF_EXISTS(dst, src, m_lastGroundedPos);
+    CA_COPY_IF_EXISTS(dst, src, m_isSideways);
+    CA_COPY_IF_EXISTS(dst, src, m_isGoingLeft);
+
     dst->m_isShip = src->m_isShip;
     dst->m_isBird = src->m_isBird;
     dst->m_isBall = src->m_isBall;
@@ -505,9 +591,13 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     s.traceDone = false;
 
     // Put the tracer in the same button state the game is in right now.
+    // If your exact hold/buffer state was copied, it already matches. Otherwise
+    // it's recreated with a press/release (less exact for orbs).
     bool held = s.heldInGame;
-    if (held) s.fake->pushButton(PlayerButton::Jump);
-    else      s.fake->releaseButton(PlayerButton::Jump);
+    if (!kCopiesHoldState) {
+        if (held) s.fake->pushButton(PlayerButton::Jump);
+        else      s.fake->releaseButton(PlayerButton::Jump);
+    }
 
     // Orb fix: in the real game, a click uses whatever orb you touched on the
     // previous tick. A freshly copied tracer hasn't touched anything yet, so
@@ -531,6 +621,12 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
         s.lastKept.clear();
         if (builtinWave) {
             CCRect before = tracerRect();
+            // GD's player code applies orb/portal effects (gravity flips, size
+            // changes) to the tracer; the position it computes is thrown away,
+            // because the built-in wave movement is exact.
+            CCPoint keep = s.fake->m_position;
+            s.fake->update(stepDt);
+            setTracerPos(keep);
             waveStep(held);
             pl->checkCollisions(s.fake, collDt, false);   // orbs, portals, moving objects
             if (!s.traceDied && waveCollide(before)) {
@@ -793,6 +889,35 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         }
     }
 
+    // Moving objects: watches the area AHEAD of you every tick, so objects already
+    // have a known speed by the time you click near them. One cheap lookup per
+    // tick, cycling through four spots in front of / above / below you.
+    void scoutAhead() {
+        if (!predictMoving() || s.realDx < 0.01f || s.collideDt <= 0.f || !m_player1) return;
+        auto pl = PlayLayer::get();
+        if (!ensureTracer(pl)) return;
+
+        static const float aheadTicks[4] = {10.f, 25.f, 18.f, 18.f};
+        static const float yOffset[4]    = {0.f, 0.f, 50.f, -50.f};
+        int k = s.tick & 3;
+
+        copyPlayerState(s.fake, m_player1);
+        s.nodeOffset = m_player1->getPosition() - m_player1->m_position;
+        CCPoint p = m_player1->m_position;
+        p.x += s.realDx * aheadTicks[k];
+        p.y += yOffset[k];
+        s.fake->m_lastPosition = p;
+        setTracerPos(p);
+
+        s.tracing = true;
+        s.scouting = true;
+        pl->checkCollisions(s.fake, s.collideDt, true);
+        s.scouting = false;
+        s.tracing = false;
+        s.traceDied = false;
+        s.traceDone = false;
+    }
+
     // Sends queued inputs in order, each on its planned tick.
     void processQueue() {
         if (m_gameState.m_isDualMode) { flushQueue(); return; }
@@ -845,6 +970,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         releaseAssistCheck();
         processQueue();
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        scoutAhead();
         s.tick++;
     }
 
@@ -860,6 +986,11 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
     //  - everything else (coins, triggers, decoration): ignored
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
                                int count, float dt) {
+        // Scouting: just remember where the objects ahead are, nothing else runs.
+        if (s.scouting && player == s.fake && objects) {
+            trackObjects(objects, std::min(count, static_cast<int>(objects->size())));
+            return;
+        }
         if (!s.tracing || player != s.fake || !objects) {
             if (!s.tracing && objects && assistEnabled() && predictMoving()
                 && isActivePlayLayer() && player == m_player1) {
