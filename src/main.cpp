@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v13";
+static constexpr char const* kBuildTag = "tracer-v14";
 
 // =====================================================================
 // How it works
@@ -68,6 +68,8 @@ struct AssistState {
     // Timestep calibration: how far you really move per tick, and the factor
     // the tracer's timestep needs so it moves the same distance.
     float realDx = 0.f;
+    float prevTickX = 0.f;
+    int prevTickNum = -1000;
     float dtScale = 0.f;                 // 0 = not calibrated yet
     bool frozen = false;                 // tracer doesn't move at any timestep
 
@@ -120,6 +122,7 @@ struct AssistState {
         lines.clear();
         dtScale = 0.f;
         frozen = false;
+        prevTickNum = -1000;
         tracks.clear();
         movedForTrace.clear();
     }
@@ -401,7 +404,10 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     if (!ensureTracer(pl))  { s.diagReason = "no tracer"; return -1; }
     calibrateTracer(pl);
     if (s.frozen)           { s.diagReason = "tracer does not move"; return -1; }
-    if (s.dtScale <= 0.f)   { s.diagReason = "calibrating (move first)"; return -1; }
+    if (s.dtScale <= 0.f) {
+        s.diagReason = fmt::format("calibrating (realDx {:.4f}, dt {:.5f})", s.realDx, s.playerDt);
+        return -1;
+    }
     float stepDt = s.playerDt * s.dtScale;
     float collDt = s.collideDt * s.dtScale;
 
@@ -653,13 +659,20 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         if (s.tracing || !assistEnabled() || !isActivePlayLayer()) {
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
-        processQueue();
-        float x0 = m_player1 ? m_player1->m_position.x : 0.f;
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        // Measure how far you really move per tick, from one tick's start to the
+        // next. This works no matter where in the tick GD moves the player.
         if (m_player1) {
-            float dx = m_player1->m_position.x - x0;
-            if (dx > 0.01f && dx < 100.f) s.realDx = dx;   // ignore resets/teleports
+            float x = m_player1->m_position.x;
+            if (s.prevTickNum == s.tick - 1) {
+                float dx = x - s.prevTickX;
+                if (dx > 0.01f && dx < 100.f) s.realDx = dx;   // ignore resets/teleports
+            }
+            s.prevTickX = x;
+            s.prevTickNum = s.tick;
         }
+
+        processQueue();
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         s.tick++;
     }
 
