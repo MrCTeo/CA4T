@@ -5,10 +5,10 @@
     "android": "2.2081",
     "mac": "2.2081"
   },
-  "id": "yourname.click-assist",
+  "id": "MrCTeo.click-assist",
   "name": "Click Assist (Practice)",
   "version": "v0.1.0",
-  "developer": "YourName",
+  "developer": "MrCTeo",
   "description": "Practice aid: an invisible tracer checks every press and release, and sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
   "settings": {
     "enabled": {
@@ -68,6 +68,44 @@
         "arrows": true,
         "input": true
       }
+    },
+    "wave-spam": {
+      "type": "bool",
+      "name": "Wave spam fix",
+      "description": "When you spam on wave, inputs are never allowed to pile up: anything still waiting is sent immediately, and each spam input can only move a tiny bit, so your rhythm stays intact.",
+      "default": true
+    },
+    "spam-gap": {
+      "type": "int",
+      "name": "Spam gap (ticks)",
+      "description": "Wave inputs closer together than this count as spam. 15 ticks is about 60 ms.",
+      "default": 15,
+      "min": 4,
+      "max": 40,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "spam-max-delay": {
+      "type": "int",
+      "name": "Spam max delay (ticks)",
+      "description": "How far a spam input may be moved to dodge a death. 0 means spam inputs are never moved.",
+      "default": 1,
+      "min": 0,
+      "max": 4,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "predict-moving": {
+      "type": "bool",
+      "name": "Predict moving objects",
+      "description": "Tracks how objects near you are moving, so the tracer checks against where they will be instead of where they are right now.",
+      "default": true
     },
     "debug": {
       "type": "bool",
