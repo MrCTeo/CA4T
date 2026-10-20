@@ -101,6 +101,25 @@
         "input": true
       }
     },
+    "release-assist": {
+      "type": "bool",
+      "name": "Release Assist",
+      "description": "If you hold longer than the limit below, the mod lets go for you on the first tick where releasing doesn't kill you, using the same safety check as your clicks. Your own release afterwards is skipped. Not used in ship, swing, robot, dual or platformer.",
+      "default": false
+    },
+    "release-assist-after": {
+      "type": "int",
+      "name": "Release Assist limit (ticks)",
+      "description": "How long you have to hold before Release Assist starts looking for a safe moment to let go. 240 ticks is 1 second.",
+      "default": 120,
+      "min": 60,
+      "max": 240,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
     "predict-moving": {
       "type": "bool",
       "name": "Predict moving objects",
