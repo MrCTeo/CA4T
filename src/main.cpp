@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v18";
+static constexpr char const* kBuildTag = "tracer-v19";
 
 // =====================================================================
 // How it works
@@ -355,6 +355,10 @@ static void copyPlayerState(PlayerObject* dst, PlayerObject* src) {
     dst->m_isOnGround = src->m_isOnGround;
     dst->m_yVelocity = src->m_yVelocity;
     dst->m_position = src->m_position;
+    // Where the player was last tick. GD checks collisions along the path from
+    // here to the current position; a fresh tracer had (0,0) here, so its first
+    // collision check swept across half the level and "died" instantly.
+    dst->m_lastPosition = src->m_lastPosition;
     dst->setPosition(src->getPosition());
 }
 
@@ -524,7 +528,9 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     s.traceAhead = 0;
     pl->checkCollisions(s.fake, collDt, false);
     int death = -1;
-    if (s.traceDied) death = 0;   // already touching something deadly
+    // A death in this setup pass isn't a real prediction (you're alive right
+    // now), so it's ignored. Only deaths after the tracer actually moves count.
+    s.traceDied = false;
 
     for (int t = 0; t < maxTicks && death < 0; ++t) {
         if (t == delay && held != down) {
