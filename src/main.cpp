@@ -4,11 +4,12 @@
 #include <Geode/modify/PlayerObject.hpp>
 #include <chrono>
 #include <deque>
+#include <unordered_map>
 
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v8";
+static constexpr char const* kBuildTag = "tracer-v11";
 
 // =====================================================================
 // How it works
@@ -34,6 +35,10 @@ static int  assistWindow()   { return static_cast<int>(Mod::get()->getSettingVal
 static int  releaseWindow()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-window")); }
 static int  lookaheadTicks() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead")); }
 static int  waveLookahead()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead")); }
+static bool waveSpamFix()    { return Mod::get()->getSettingValue<bool>("wave-spam"); }
+static int  spamGap()        { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-gap")); }
+static int  spamMaxDelay()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-max-delay")); }
+static bool predictMoving()  { return Mod::get()->getSettingValue<bool>("predict-moving"); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
 
 // ---------- state ----------
@@ -45,7 +50,8 @@ struct PendingInput {
     int fireTick = -1;       // -1 = not planned yet
     int firstDeath = -1;     // where the on-time input would have died
     bool foundSafe = true;
-    bool skipped = false;    // not checked (gamemode not assisted)
+    bool skipped = false;
+    bool spam = false;       // part of fast wave spam    // not checked (gamemode not assisted)
 };
 
 struct AssistState {
@@ -63,6 +69,7 @@ struct AssistState {
     // Inputs
     std::deque<PendingInput> queue;
     bool heldInGame = false;   // what the game currently thinks the button is
+    int lastRealInputTick = -100000;
     int pressShift = 0;        // how late the last press was sent (applied to its release)
     bool injecting = false;
     double planMs = 0.0;
@@ -72,6 +79,14 @@ struct AssistState {
     std::vector<Touched> touched;
     int diagOrbs = 0;                    // interactables the tracer touched
     int diagFallbackDeaths = 0;          // deaths found by our own hitbox check
+
+    // Moving objects: positions of objects near you are tracked every real
+    // tick, so the tracer can move them ahead in time while it predicts.
+    struct Track { CCPoint lastPos; CCPoint vel; int lastTick = -1000; };
+    std::unordered_map<GameObject*, Track> tracks;
+    std::unordered_map<GameObject*, CCPoint> movedForTrace;   // original positions
+    int traceAhead = 0;                  // ticks into the future the tracer is at
+    int diagMovers = 0;
 
     // Diagnostics (last trace)
     int diagTicks = 0;
@@ -94,9 +109,12 @@ struct AssistState {
         traceDone = false;
         queue.clear();
         heldInGame = false;
+        lastRealInputTick = -100000;
         pressShift = 0;
         injecting = false;
         lines.clear();
+        tracks.clear();
+        movedForTrace.clear();
     }
 };
 
@@ -120,13 +138,13 @@ static void debugDiag() {
         log::info("[CA]    SKIPPED: {}", s.diagReason);
         return;
     }
-    log::info("[CA]    ticks {} moved {:.1f},{:.1f} start-off {:.1f} coll {} objs {} orbs {} backup {} timeout {} dt {:.5f}/{:.5f}",
+    log::info("[CA]    ticks {} moved {:.1f},{:.1f} start-off {:.1f} coll {} objs {} orbs {} movers {} backup {} timeout {} dt {:.5f}/{:.5f}",
               s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
-              s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagFallbackDeaths,
+              s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers, s.diagFallbackDeaths,
               s.diagTimedOut, s.playerDt, s.collideDt);
-    debugLine(fmt::format("   ticks {} moved {:.0f},{:.0f} start-off {:.1f} coll {} objs {} orbs {}{}{}",
+    debugLine(fmt::format("   ticks {} moved {:.0f},{:.0f} start-off {:.1f} coll {} objs {} orbs {} movers {}{}{}",
                           s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
-                          s.diagCollChecks, s.diagMaxObjs, s.diagOrbs,
+                          s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers,
                           s.diagFallbackDeaths ? " BACKUP-DEATH" : "",
                           s.diagTimedOut ? " TIMEOUT" : ""));
 }
@@ -222,6 +240,62 @@ static void removeNewChildren(CCNode* node, unsigned int oldCount) {
     }
 }
 
+// ---------- moving objects ----------
+
+// Called with the objects near the real player every tick.
+static void trackObjects(gd::vector<GameObject*>* objects, int n) {
+    for (int i = 0; i < n; ++i) {
+        auto obj = (*objects)[i];
+        if (!obj) continue;
+        auto& tr = s.tracks[obj];
+        if (tr.lastTick == s.tick) continue;          // already seen this tick
+        CCPoint pos = obj->getPosition();
+        int gap = s.tick - tr.lastTick;
+        if (gap >= 1 && gap <= 8) {
+            CCPoint v = (pos - tr.lastPos) / static_cast<float>(gap);
+            // Smooth a little so one odd frame doesn't throw the prediction off.
+            tr.vel = gap == 1 ? (tr.vel * 0.3f + v * 0.7f) : v;
+        } else {
+            tr.vel = CCPointZero;
+        }
+        tr.lastPos = pos;
+        tr.lastTick = s.tick;
+    }
+    // Forget objects that haven't been near you for a while.
+    if ((s.tick & 255) == 0) {
+        for (auto it = s.tracks.begin(); it != s.tracks.end();) {
+            if (s.tick - it->second.lastTick > 240) it = s.tracks.erase(it);
+            else ++it;
+        }
+    }
+}
+
+// Moves an object to where it will be `ahead` ticks from now (tracer only).
+static void moveAhead(GameObject* obj, int ahead) {
+    auto it = s.tracks.find(obj);
+    if (it == s.tracks.end()) return;
+    auto& tr = it->second;
+    if (s.tick - tr.lastTick > 2) return;              // no fresh data
+    if (std::abs(tr.vel.x) < 0.001f && std::abs(tr.vel.y) < 0.001f) return;
+
+    auto saved = s.movedForTrace.find(obj);
+    CCPoint origin;
+    if (saved == s.movedForTrace.end()) {
+        origin = obj->getPosition();
+        s.movedForTrace[obj] = origin;
+    } else {
+        origin = saved->second;
+    }
+    obj->setPosition(origin + tr.vel * static_cast<float>(ahead));
+}
+
+// Puts every object the tracer moved back where it really is.
+static void restoreMoved() {
+    s.diagMovers = static_cast<int>(s.movedForTrace.size());
+    for (auto& [obj, pos] : s.movedForTrace) obj->setPosition(pos);
+    s.movedForTrace.clear();
+}
+
 // ---------- tracer ----------
 
 static void injectButton(GJBaseGameLayer* layer, bool down) {
@@ -280,6 +354,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     s.diagTimedOut = false;
     s.diagOrbs = 0;
     s.diagFallbackDeaths = 0;
+    s.diagMovers = 0;
     s.diagReason.clear();
     s.touched.clear();
 
@@ -303,13 +378,23 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     if (held) s.fake->pushButton(PlayerButton::Jump);
     else      s.fake->releaseButton(PlayerButton::Jump);
 
+    // Orb fix: in the real game, a click uses whatever orb you touched on the
+    // previous tick. A freshly copied tracer hasn't touched anything yet, so
+    // clicking inside an orb did a normal jump instead of the orb. One collision
+    // pass at your current position first lets the tracer "touch" the orb you're
+    // in, exactly like you already have.
+    s.traceAhead = 0;
+    pl->checkCollisions(s.fake, s.collideDt, false);
     int death = -1;
-    for (int t = 0; t < maxTicks; ++t) {
+    if (s.traceDied) death = 0;   // already touching something deadly
+
+    for (int t = 0; t < maxTicks && death < 0; ++t) {
         if (t == delay && held != down) {
             if (down) s.fake->pushButton(PlayerButton::Jump);
             else      s.fake->releaseButton(PlayerButton::Jump);
             held = down;
         }
+        s.traceAhead = t + 1;
         s.fake->update(s.playerDt);
         pl->checkCollisions(s.fake, s.collideDt, false);
         s.diagTicks = t + 1;
@@ -328,6 +413,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
 
     // Put the level back exactly as it was.
     restoreTouched();
+    restoreMoved();
     removeNewChildren(pl->m_objectLayer, objLayerCount);
     removeNewChildren(pl, plCount);
 
@@ -364,6 +450,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     int look = pl->m_player1->m_isDart ? waveLookahead() : lookaheadTicks();
     // Presses and releases each have their own search window.
     int window = in.down ? assistWindow() : releaseWindow();
+    if (in.spam) window = std::min(window, spamMaxDelay());
     int chosen = 0;
     in.foundSafe = false;
     in.firstDeath = -1;
@@ -382,7 +469,8 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
 
 static void logDecision(PendingInput const& in, int delay) {
     if (in.skipped) return;
-    char const* what = in.down ? "press  " : "release";
+    char const* what = in.spam ? (in.down ? "press* " : "release*")
+                               : (in.down ? "press  " : "release");
     if (in.firstDeath < 0) {
         debugLine(fmt::format("{} +0 safe  ({:.2f}ms)", what, s.planMs));
     } else if (in.foundSafe) {
@@ -432,10 +520,34 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
 
+        // Dual mode: the assist steps aside completely. Anything still waiting is
+        // sent right now, and every input goes straight to the game, so both
+        // players always get your clicks exactly as you make them.
+        if (m_gameState.m_isDualMode) {
+            flushQueue();
+            s.heldInGame = down;
+            s.pressShift = 0;
+            return GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        }
+
+        // Wave spam fix: inputs closer together than the spam gap count as spam.
+        // While spamming, nothing is allowed to pile up: anything still waiting
+        // is sent right now, and each input may only move a tiny bit.
+        int gap = s.tick - s.lastRealInputTick;
+        s.lastRealInputTick = s.tick;
+        bool spamming = waveSpamFix() && pl->m_player1->m_isDart && gap < spamGap();
+
+        if (spamming && !s.queue.empty()) {
+            int flushed = static_cast<int>(s.queue.size());
+            flushQueue();
+            debugLine(fmt::format("wave spam: sent {} waiting input(s) now", flushed));
+        }
+
         PendingInput in;
         in.down = down;
+        in.spam = spamming;
         in.realTick = s.tick;
-        in.base = s.tick + (down ? 0 : s.pressShift);
+        in.base = s.tick + ((down || spamming) ? 0 : s.pressShift);
 
         if (s.queue.empty() && in.base <= s.tick) {
             int delay = planInput(pl, in);
@@ -450,8 +562,20 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         s.queue.push_back(in);
     }
 
+    // Sends everything still waiting right now, in order.
+    void flushQueue() {
+        while (!s.queue.empty()) {
+            PendingInput w = s.queue.front();
+            s.queue.pop_front();
+            injectButton(this, w.down);
+            applied(w, s.tick);
+        }
+        s.pressShift = 0;
+    }
+
     // Sends queued inputs in order, each on its planned tick.
     void processQueue() {
+        if (m_gameState.m_isDualMode) { flushQueue(); return; }
         auto pl = PlayLayer::get();
         while (!s.queue.empty()) {
             auto& in = s.queue.front();
@@ -504,6 +628,10 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
                                int count, float dt) {
         if (!s.tracing || player != s.fake || !objects) {
+            if (!s.tracing && objects && assistEnabled() && predictMoving()
+                && isActivePlayLayer() && player == m_player1) {
+                trackObjects(objects, std::min(count, static_cast<int>(objects->size())));
+            }
             return GJBaseGameLayer::collisionCheckObjects(player, objects, count, dt);
         }
 
@@ -525,6 +653,11 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             } else if (isLevelChangingPortal(type)) {
                 if (playerRect.intersectsRect(obj->getObjectRect())) s.traceDone = true;
             }
+        }
+
+        // Moving objects: put each one where it will be at this point of the prediction.
+        if (predictMoving() && s.traceAhead > 0) {
+            for (auto obj : kept) moveAhead(obj, s.traceAhead);
         }
 
         s.diagCollChecks++;
