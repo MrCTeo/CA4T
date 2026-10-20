@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v21";
+static constexpr char const* kBuildTag = "tracer-v22";
 
 // =====================================================================
 // How it works
@@ -39,6 +39,8 @@ static bool waveSpamFix()    { return Mod::get()->getSettingValue<bool>("wave-sp
 static int  spamGap()        { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-gap")); }
 static int  spamMaxDelay()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-max-delay")); }
 static bool predictMoving()  { return Mod::get()->getSettingValue<bool>("predict-moving"); }
+static bool releaseAssist()  { return Mod::get()->getSettingValue<bool>("release-assist"); }
+static int  releaseAssistAfter() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-assist-after")); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
 
@@ -53,6 +55,8 @@ struct PendingInput {
     bool foundSafe = true;
     bool skipped = false;    // not checked (gamemode not assisted)
     bool spam = false;       // part of fast wave spam
+    bool autoRelease = false; // made by Release Assist, not by you
+    bool checked = false;    // the tracer actually verified the chosen tick
 };
 
 struct AssistState {
@@ -82,6 +86,12 @@ struct AssistState {
     int pressShift = 0;        // how late the last press was sent (applied to its release)
     bool injecting = false;
     double planMs = 0.0;
+
+    // Release Assist
+    bool physHeld = false;       // you are physically holding the button
+    int holdStartTick = 0;       // tick the current press reached the game
+    bool autoReleased = false;   // Release Assist let go for you; your own release is skipped
+    int nextAutoCheck = 0;       // earliest tick to look for a release again
 
     // Objects the tracer used (orbs, pads, portals): their activation is put back after each trace
     struct Touched { GameObject* obj; bool activated; };
@@ -118,6 +128,10 @@ struct AssistState {
         traceDone = false;
         queue.clear();
         heldInGame = false;
+        physHeld = false;
+        holdStartTick = 0;
+        autoReleased = false;
+        nextAutoCheck = 0;
         lastRealInputTick = -100000;
         pressShift = 0;
         injecting = false;
@@ -610,7 +624,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
         if (!s.diagReason.empty()) { chosen = 0; in.foundSafe = true; break; }
         // Ran out of time before finding a safe tick: send on time.
         if (s.diagTimedOut) { chosen = 0; in.foundSafe = false; break; }
-        if (death < 0) { chosen = d; in.foundSafe = true; break; }
+        if (death < 0) { chosen = d; in.foundSafe = true; in.checked = true; break; }
     }
 
     s.planMs = std::chrono::duration<double, std::milli>(
@@ -620,7 +634,8 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
 
 static void logDecision(PendingInput const& in, int delay) {
     if (in.skipped) return;
-    char const* what = in.spam ? (in.down ? "press* " : "release*")
+    char const* what = in.autoRelease ? "auto-release"
+                     : in.spam ? (in.down ? "press* " : "release*")
                                : (in.down ? "press  " : "release");
     if (in.firstDeath < 0) {
         debugLine(fmt::format("{} +0 safe  ({:.2f}ms)", what, s.planMs));
@@ -643,6 +658,8 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
 
     void applied(PendingInput const& in, int fireTick) {
         s.heldInGame = in.down;
+        if (in.down) s.holdStartTick = fireTick;
+        if (in.autoRelease) s.autoReleased = true;
         // A delayed press shifts its release by the same amount, so your hold
         // length stays exactly the same. After a release, nothing carries over.
         s.pressShift = in.down ? (fireTick - in.realTick) : 0;
@@ -659,6 +676,26 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
 
+        // Release Assist bookkeeping.
+        s.physHeld = down;
+        if (down) {
+            s.autoReleased = false;
+            s.nextAutoCheck = 0;
+        } else {
+            if (s.autoReleased) {
+                // Release Assist already let go for you: the game isn't holding,
+                // so your own release has nothing left to do.
+                s.autoReleased = false;
+                return;
+            }
+            // You let go before Release Assist's planned release: drop that plan
+            // and handle your own release normally.
+            for (auto it = s.queue.begin(); it != s.queue.end();) {
+                if (it->autoRelease) it = s.queue.erase(it);
+                else ++it;
+            }
+        }
+
         // Not assisted in this gamemode (ship, swing, robot releases). If nothing
         // is waiting, the input goes straight through; otherwise it queues
         // behind the waiting ones to keep the order.
@@ -667,6 +704,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         bool needsShift = !down && s.pressShift > 0;
         if (assistOff(pl->m_player1, down) && s.queue.empty() && !needsShift) {
             s.heldInGame = down;
+            if (down) s.holdStartTick = s.tick;
             s.pressShift = 0;
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
@@ -677,6 +715,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         if (m_gameState.m_isDualMode) {
             flushQueue();
             s.heldInGame = down;
+            if (down) s.holdStartTick = s.tick;
             s.pressShift = 0;
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
@@ -722,6 +761,36 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             applied(w, s.tick);
         }
         s.pressShift = 0;
+    }
+
+    // Release Assist: once you've held longer than the limit, find the first tick
+    // where letting go doesn't kill you (same check as normal inputs) and let go
+    // for you there. If no tick is safe yet, it keeps you holding and looks again.
+    void releaseAssistCheck() {
+        if (!releaseAssist()) return;
+        if (!s.physHeld || !s.heldInGame || s.autoReleased || !s.queue.empty()) return;
+        if (m_gameState.m_isDualMode) return;
+        auto pl = PlayLayer::get();
+        auto p = pl->m_player1;
+        if (p->m_isPlatformer || assistOff(p, false)) return;      // ship, swing, robot
+        if (s.tick - s.holdStartTick < releaseAssistAfter()) return;
+        if (s.tick < s.nextAutoCheck) return;
+
+        PendingInput in;
+        in.down = false;
+        in.autoRelease = true;
+        in.realTick = s.tick;
+        in.base = s.tick;
+        int delay = planInput(pl, in);
+
+        if (in.checked) {
+            logDecision(in, delay);
+            in.fireTick = s.tick + delay;
+            s.queue.push_back(in);
+        } else {
+            // Nothing safe (or couldn't check): keep holding, look again soon.
+            s.nextAutoCheck = s.tick + std::max(1, releaseWindow());
+        }
     }
 
     // Sends queued inputs in order, each on its planned tick.
@@ -773,6 +842,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             s.prevTickNum = s.tick;
         }
 
+        releaseAssistCheck();
         processQueue();
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         s.tick++;
@@ -912,7 +982,10 @@ class $modify(AssistPlayLayer, PlayLayer) {
         bool on = assistEnabled();
         if (auto label = m_fields->label) {
             label->setVisible(on);
-            if (on) label->setString(fmt::format("CA {}p/{}r {}", assistWindow(), releaseWindow(), kBuildTag).c_str());
+            if (on) {
+                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
+                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
+            }
         }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
