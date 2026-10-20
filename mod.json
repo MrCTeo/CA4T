@@ -107,6 +107,19 @@
       "description": "Tracks how objects near you are moving, so the tracer checks against where they will be instead of where they are right now.",
       "default": true
     },
+    "force-delay": {
+      "type": "int",
+      "name": "TEST: force press delay (ticks)",
+      "description": "For testing only. Delays EVERY press by this many ticks without any prediction, to check that holding back clicks works at all. 0 = off (normal assist).",
+      "default": 0,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
     "debug": {
       "type": "bool",
       "name": "Debug panel",
