@@ -9,7 +9,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v11";
+static constexpr char const* kBuildTag = "tracer-v12";
 
 // =====================================================================
 // How it works
@@ -142,8 +142,8 @@ static void debugDiag() {
               s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
               s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers, s.diagFallbackDeaths,
               s.diagTimedOut, s.playerDt, s.collideDt);
-    debugLine(fmt::format("   ticks {} moved {:.0f},{:.0f} start-off {:.1f} coll {} objs {} orbs {} movers {}{}{}",
-                          s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
+    debugLine(fmt::format("   ticks {} moved {:.3f},{:.3f} dt {:.5f}/{:.5f} coll {} objs {} orbs {} movers {}{}{}",
+                          s.diagTicks, s.diagMovedX, s.diagMovedY, s.playerDt, s.collideDt,
                           s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers,
                           s.diagFallbackDeaths ? " BACKUP-DEATH" : "",
                           s.diagTimedOut ? " TIMEOUT" : ""));
