@@ -1067,7 +1067,7 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, debug panel, safe mode ----------
+// ---------- play layer: tracer deaths, debug panel ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -1079,8 +1079,6 @@ class $modify(AssistPlayLayer, PlayLayer) {
         s.debugLabel = nullptr;
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-
-        if (assistEnabled()) m_isTestMode = true;
 
         auto win = CCDirector::get()->getWinSize();
 
@@ -1104,8 +1102,6 @@ class $modify(AssistPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
-        // Safe mode: test mode stops progress and completions from saving.
-        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
