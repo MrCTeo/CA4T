@@ -11,7 +11,7 @@
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v27";
+static constexpr char const* kBuildTag = "tracer-v28";
 
 // =====================================================================
 // How it works
@@ -43,6 +43,8 @@ static int  spamMaxDelay()   { return static_cast<int>(Mod::get()->getSettingVal
 static bool predictMoving()  { return Mod::get()->getSettingValue<bool>("predict-moving"); }
 static bool releaseAssist()  { return Mod::get()->getSettingValue<bool>("release-assist"); }
 static int  releaseAssistAfter() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-assist-after")); }
+static int  orbWindow()      { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-window")); }
+static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-catch")); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
 
@@ -58,6 +60,7 @@ struct PendingInput {
     bool skipped = false;    // not checked (gamemode not assisted)
     bool spam = false;       // part of fast wave spam
     bool autoRelease = false; // made by Release Assist, not by you
+    bool orb = false;        // a click on/near an orb
     bool checked = false;    // the tracer actually verified the chosen tick
 };
 
@@ -76,6 +79,7 @@ struct AssistState {
     float realDx = 0.f;
     float traceDx = 0.f;                 // tracer's forward speed (changes at speed portals)
     int orbCutoff = -1;                  // after this trace tick, orbs need a new click
+    bool traceUsedOrb = false;           // the tracer's click fired an orb
     float prevTickX = 0.f;
     int prevTickNum = -1000;
     // Offset between your drawn position and your physics position.
@@ -618,7 +622,8 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     // A press is checked as exactly that one click: it can fire the orb you
     // click on (GD gives a click a couple of ticks to catch an orb), but orbs
     // reached later need a new click, so the tracer doesn't take them.
-    s.orbCutoff = down ? delay + 2 : -1;
+    s.orbCutoff = down ? delay + orbCatch() : -1;
+    s.traceUsedOrb = false;
     s.diagTicks = 0;
     s.diagCollChecks = 0;
     s.diagMaxObjs = 0;
@@ -785,7 +790,14 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
 
     for (int d = 0; d <= window; ++d) {
         int death = traceInput(pl, d, in.down, d + look, deadline);
-        if (d == 0) in.firstDeath = death;
+        if (d == 0) {
+            in.firstDeath = death;
+            // A click on/near an orb uses the orb search window instead.
+            if (in.down && s.traceUsedOrb && !in.spam) {
+                window = orbWindow();
+                in.orb = true;
+            }
+        }
         // Couldn't check (see SKIPPED reason): send on time.
         if (!s.diagReason.empty()) { chosen = 0; in.foundSafe = true; break; }
         // Ran out of time before finding a safe tick: send on time.
@@ -801,6 +813,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
 static void logDecision(PendingInput const& in, int delay) {
     if (in.skipped) return;
     char const* what = in.autoRelease ? "auto-release"
+                     : in.orb ? "orb    "
                      : in.spam ? (in.down ? "press* " : "release*")
                                : (in.down ? "press  " : "release");
     if (in.firstDeath < 0) {
@@ -1088,7 +1101,10 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             if (isSolidOrHazard(type)) {
                 kept.push_back(obj);
             } else if (isPlayerOnlyInteractable(type)) {
-                if (isOrb(type) && s.orbCutoff >= 0 && s.traceAhead > s.orbCutoff) continue;
+                if (isOrb(type) && s.orbCutoff >= 0) {
+                    if (s.traceAhead > s.orbCutoff) continue;
+                    s.traceUsedOrb = true;
+                }
                 rememberTouched(obj);
                 kept.push_back(obj);
             } else if (isLevelChangingPortal(type)) {
