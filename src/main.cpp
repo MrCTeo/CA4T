@@ -33,6 +33,7 @@ static bool assistEnabled()  { return Mod::get()->getSettingValue<bool>("enabled
 static int  assistWindow()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("window")); }
 static int  releaseWindow()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-window")); }
 static int  lookaheadTicks() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead")); }
+static int  releaseLookahead() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-lookahead")); }
 static int  waveLookahead()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead")); }
 static bool waveSpamFix()    { return Mod::get()->getSettingValue<bool>("wave-spam"); }
 static int  spamGap()        { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-gap")); }
@@ -76,6 +77,7 @@ struct AssistState {
     float realDx = 0.f;
     float traceDx = 0.f;                 // tracer's forward speed (changes at speed portals)
     int orbCutoff = -1;                  // after this trace tick, orbs need a new click
+    int lastLook = 0;                    // safety check length used for the last input
     bool traceUsedOrb = false;           // the tracer's click fired an orb
     float prevTickX = 0.f;
     int prevTickNum = -1000;
@@ -87,7 +89,8 @@ struct AssistState {
     // Inputs
     std::deque<PendingInput> queue;
     bool heldInGame = false;   // what the game currently thinks the button is
-    int lastRealInputTick = -100000;
+    int lastRealInputTick = -100000;   // last real press (for spam detection)
+    bool pressWasSpam = false;
     int pressShift = 0;        // how late the last press was sent (applied to its release)
     bool injecting = false;
     double planMs = 0.0;
@@ -148,6 +151,7 @@ struct AssistState {
         autoReleased = false;
         nextAutoCheck = 0;
         lastRealInputTick = -100000;
+        pressWasSpam = false;
         pressShift = 0;
         injecting = false;
         lines.clear();
@@ -181,8 +185,8 @@ static void debugDiag() {
               s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
               s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers, s.diagFallbackDeaths,
               s.diagTimedOut, s.playerDt, s.collideDt);
-    debugLine(fmt::format("   ticks {} moved {:.3f},{:.3f} dt {:.5f}/{:.5f} speed {:.3f} coll {} objs {} orbs {} movers {}{}{}",
-                          s.diagTicks, s.diagMovedX, s.diagMovedY, s.playerDt, s.collideDt, s.realDx,
+    debugLine(fmt::format("   check {} ticks {} moved {:.3f},{:.3f} dt {:.5f}/{:.5f} speed {:.3f} coll {} objs {} orbs {} movers {}{}{}",
+                          s.lastLook, s.diagTicks, s.diagMovedX, s.diagMovedY, s.playerDt, s.collideDt, s.realDx,
                           s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers,
                           s.diagFallbackDeaths ? " BACKUP-DEATH" : "",
                           s.diagTimedOut ? " TIMEOUT" : ""));
@@ -777,7 +781,13 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     auto start = std::chrono::steady_clock::now();
     auto deadline = start + std::chrono::microseconds(4000);
 
-    int look = pl->m_player1->m_isDart ? waveLookahead() : lookaheadTicks();
+    // How far ahead to look for a death after this input:
+    //  - your releases: the release safety check (falling into something after
+    //    letting go early often happens later than a click's death would)
+    //  - presses and Release Assist: the normal or wave safety check
+    int look = (!in.down && !in.autoRelease) ? releaseLookahead()
+             : pl->m_player1->m_isDart ? waveLookahead() : lookaheadTicks();
+    s.lastLook = look;
     // Presses and releases each have their own search window.
     int window = in.down ? assistWindow() : releaseWindow();
     if (in.spam) window = std::min(window, spamMaxDelay());
@@ -896,12 +906,20 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
 
-        // Wave spam fix: inputs closer together than the spam gap count as spam.
+        // Wave spam fix: PRESSES closer together than the spam gap count as spam
+        // (measured press to press, so a normal quick tap is not spam). A release
+        // belongs to its press: it's spam only if that press was.
         // While spamming, nothing is allowed to pile up: anything still waiting
         // is sent right now, and each input may only move a tiny bit.
-        int gap = s.tick - s.lastRealInputTick;
-        s.lastRealInputTick = s.tick;
-        bool spamming = waveSpamFix() && pl->m_player1->m_isDart && gap < spamGap();
+        bool spamming = false;
+        if (down) {
+            int gap = s.tick - s.lastRealInputTick;
+            s.lastRealInputTick = s.tick;
+            spamming = waveSpamFix() && pl->m_player1->m_isDart && gap < spamGap();
+            s.pressWasSpam = spamming;
+        } else {
+            spamming = s.pressWasSpam && waveSpamFix() && pl->m_player1->m_isDart;
+        }
 
         if (spamming && !s.queue.empty()) {
             int flushed = static_cast<int>(s.queue.size());
