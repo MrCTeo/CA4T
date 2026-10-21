@@ -69,6 +69,12 @@
         "input": true
       }
     },
+    "random-pick": {
+      "type": "bool",
+      "name": "Random safe tick",
+      "description": "When a click has to be moved, check every tick in the window and pick one of the safe ones at random instead of always the first. Clicks that are already safe on time are never moved. Uses more time per click.",
+      "default": false
+    },
     "lookahead": {
       "type": "int",
       "name": "Safety check (ticks)",
