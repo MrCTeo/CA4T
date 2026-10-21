@@ -114,6 +114,225 @@
         "input": true
       }
     },
+    "check-time": {
+      "type": "int",
+      "name": "Check time limit (ms)",
+      "description": "How long the mod may spend checking one input. Releases that need a long search (letting go several ticks too early) can run out of time; raising this gives them room. Higher values can cause small stutters on heavy levels.",
+      "default": 8,
+      "min": 2,
+      "max": 16,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "wave-spam": {
+      "type": "bool",
+      "name": "Wave spam fix",
+      "description": "When you spam on wave, inputs are never allowed to pile up: anything still waiting is sent immediately, and each spam input can only move a tiny bit, so your rhythm stays intact.",
+      "default": true
+    },
+    "spam-gap": {
+      "type": "int",
+      "name": "Spam gap (ticks)",
+      "description": "Wave inputs closer together than this count as spam. 15 ticks is about 60 ms.",
+      "default": 15,
+      "min": 4,
+      "max": 40,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "spam-max-delay": {
+      "type": "int",
+      "name": "Spam max delay (ticks)",
+      "description": "How far a spam input may be moved to dodge a death. 0 means spam inputs are never moved.",
+      "default": 1,
+      "min": 0,
+      "max": 4,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "release-assist": {
+      "type": "bool",
+      "name": "Release Assist",
+      "description": "If you hold longer than the limit below, the mod lets go for you on the first tick where releasing doesn't kill you, using the same safety check as your clicks. Your own release afterwards is skipped. Not used in ship, swing, robot, dual or platformer.",
+      "default": false
+    },
+    "release-assist-after": {
+      "type": "int",
+      "name": "Release Assist limit (ticks)",
+      "description": "How long you have to hold before Release Assist starts looking for a safe moment to let go. 240 ticks is 1 second.",
+      "default": 120,
+      "min": 60,
+      "max": 240,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "predict-moving": {
+      "type": "bool",
+      "name": "Predict moving objects",
+      "description": "Tracks how objects near you are moving, so the tracer checks against where they will be instead of where they are right now.",
+      "default": true
+    },
+    "force-delay": {
+      "type": "int",
+      "name": "TEST: force press delay (ticks)",
+      "description": "For testing only. Delays EVERY press by this many ticks without any prediction, to check that holding back clicks works at all. 0 = off (normal assist).",
+      "default": 0,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "debug": {
+      "type": "bool",
+      "name": "Debug panel",
+      "description": "Shows what the assist decides on every click in the top-left corner: whether the click was safe, which tick it was sent on, and how long the check took.",
+      "default": false
+    }
+  }
+}{
+  "geode": "5.11.1",
+  "gd": {
+    "win": "2.2081",
+    "android": "2.2081",
+    "mac": "2.2081"
+  },
+  "id": "yourname.click-assist",
+  "name": "Click Assist",
+  "version": "v0.1.0",
+  "developer": "MrCTeo",
+  "description": "Practice aid: an invisible tracer checks every press and release, and sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
+  "settings": {
+    "enabled": {
+      "type": "bool",
+      "name": "Enable Click Assist",
+      "description": "Turns the assist on. While on, the attempt runs in test mode and nothing is saved.",
+      "default": false
+    },
+    "window": {
+      "type": "int",
+      "name": "Press search window (ticks)",
+      "description": "How many ticks a press may be moved later to avoid a death (up to 32). GD runs at 240 ticks per second, so 4 ticks is about 17 ms and 32 ticks about 133 ms.",
+      "default": 4,
+      "min": 1,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "release-window": {
+      "type": "int",
+      "name": "Release search window (ticks)",
+      "description": "How many ticks a release may be moved later to avoid a death (up to 32), meaning you keep holding a bit longer. Releases can only be moved later, never earlier.",
+      "default": 4,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "orb-window": {
+      "type": "int",
+      "name": "Orb search window (ticks)",
+      "description": "Like the press search window, but for clicks on or near an orb: how many ticks such a click may be held back to find a tick where it doesn't kill you.",
+      "default": 8,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "orb-catch": {
+      "type": "int",
+      "name": "Orb catch time (ticks)",
+      "description": "How many ticks after a click it can still fire an orb in the prediction. Raise it if the mod misses orbs you click just before touching them; lower it if it fires orbs too late.",
+      "default": 2,
+      "min": 0,
+      "max": 10,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "random-pick": {
+      "type": "bool",
+      "name": "Random safe tick",
+      "description": "When a click has to be moved, check every tick in the window and pick one of the safe ones at random instead of always the first. Clicks that are already safe on time are never moved. Uses more time per click.",
+      "default": false
+    },
+    "lookahead": {
+      "type": "int",
+      "name": "Safety check (ticks)",
+      "description": "How many ticks after a click it must survive for that tick to count as safe. Keep this short (15-30) so later obstacles that need another click do not count.",
+      "default": 20,
+      "min": 5,
+      "max": 360,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "wave-lookahead": {
+      "type": "int",
+      "name": "Wave safety check (ticks)",
+      "description": "Safety check used while you're in wave. Wave inputs come fast, so this is shorter: an input only has to stay safe until your next one usually arrives.",
+      "default": 10,
+      "min": 3,
+      "max": 360,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "release-lookahead": {
+      "type": "int",
+      "name": "Release safety check (ticks)",
+      "description": "How many ticks after you let go the mod checks for a death, in every gamemode including wave. Falling into something after letting go early usually happens later than a click's death, so this can be longer than the wave safety check. Release Assist keeps using the normal safety check.",
+      "default": 20,
+      "min": 3,
+      "max": 360,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "check-time": {
+      "type": "int",
+      "name": "Check time limit (ms)",
+      "description": "How long the mod may spend checking one input. Releases that need a long search (letting go several ticks too early) can run out of time; raising this gives them room. Higher values can cause small stutters on heavy levels.",
+      "default": 8,
+      "min": 2,
+      "max": 16,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
     "wave-spam": {
       "type": "bool",
       "name": "Wave spam fix",
