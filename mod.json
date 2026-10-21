@@ -43,6 +43,32 @@
         "input": true
       }
     },
+    "orb-window": {
+      "type": "int",
+      "name": "Orb search window (ticks)",
+      "description": "Like the press search window, but for clicks on or near an orb: how many ticks such a click may be held back to find a tick where it doesn't kill you.",
+      "default": 8,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "orb-catch": {
+      "type": "int",
+      "name": "Orb catch time (ticks)",
+      "description": "How many ticks after a click it can still fire an orb in the prediction. Raise it if the mod misses orbs you click just before touching them; lower it if it fires orbs too late.",
+      "default": 2,
+      "min": 0,
+      "max": 10,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
     "lookahead": {
       "type": "int",
       "name": "Safety check (ticks)",
