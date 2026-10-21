@@ -10,6 +10,9 @@
 
 using namespace geode::prelude;
 
+// Shown in the corner label so you can see which build is running.
+static constexpr char const* kBuildTag = "tracer-v27";
+
 // =====================================================================
 // How it works
 //
@@ -71,6 +74,8 @@ struct AssistState {
     float collideDt = 0.f;
     // How far you really move forward per tick (measured every tick).
     float realDx = 0.f;
+    float traceDx = 0.f;                 // tracer's forward speed (changes at speed portals)
+    int orbCutoff = -1;                  // after this trace tick, orbs need a new click
     float prevTickX = 0.f;
     int prevTickNum = -1000;
     // Offset between your drawn position and your physics position.
@@ -220,6 +225,24 @@ static bool isPlayerOnlyInteractable(GameObjectType t) {
         case GameObjectType::GravityTogglePortal:
         case GameObjectType::MiniSizePortal:
         case GameObjectType::RegularSizePortal:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Orbs: they only fire on a click.
+static bool isOrb(GameObjectType t) {
+    switch (t) {
+        case GameObjectType::YellowJumpRing:
+        case GameObjectType::PinkJumpRing:
+        case GameObjectType::GravityRing:
+        case GameObjectType::RedJumpRing:
+        case GameObjectType::GreenRing:
+        case GameObjectType::DashRing:
+        case GameObjectType::GravityDashRing:
+        case GameObjectType::DropRing:
+        case GameObjectType::CustomRing:
             return true;
         default:
             return false;
@@ -473,7 +496,49 @@ static CCRect tracerRect() {
     auto r = s_realPlayer->getObjectRect();
     CCPoint off = s.fake->m_position - s_realPlayer->m_position;
     r.origin = r.origin + off;
+    // Size portals: if the tracer became mini or normal size during the
+    // prediction, scale the hitbox the same way around its center.
+    float realSize = s_realPlayer->m_vehicleSize;
+    float fakeSize = s.fake->m_vehicleSize;
+    if (realSize > 0.f && std::abs(fakeSize - realSize) > 0.01f) {
+        float k = fakeSize / realSize;
+        float w = r.size.width * k, h = r.size.height * k;
+        r = CCRect(r.getMidX() - w / 2.f, r.getMidY() - h / 2.f, w, h);
+    }
     return r;
+}
+
+// ---------- speed portals ----------
+// GD speeds, as the player's speed value and how far that speed moves per second.
+struct SpeedInfo { int id; float playerSpeed; float unitsPerSec; };
+static constexpr SpeedInfo kSpeeds[] = {
+    {200, 0.7f, 251.16f},   // 0.5x
+    {201, 0.9f, 311.58f},   // 1x
+    {202, 1.1f, 387.42f},   // 2x
+    {203, 1.3f, 468.00f},   // 3x
+    {1334, 1.6f, 576.00f},  // 4x
+};
+
+static SpeedInfo const* speedForPortal(int objectID) {
+    for (auto& sp : kSpeeds) if (sp.id == objectID) return &sp;
+    return nullptr;
+}
+
+static SpeedInfo const* speedForPlayer(float playerSpeed) {
+    SpeedInfo const* best = &kSpeeds[1];
+    for (auto& sp : kSpeeds) {
+        if (std::abs(sp.playerSpeed - playerSpeed) < std::abs(best->playerSpeed - playerSpeed)) best = &sp;
+    }
+    return best;
+}
+
+// The tracer touched a speed portal: from now on it moves at that speed, scaled
+// from your measured speed so it stays exact.
+static void tracerHitSpeedPortal(SpeedInfo const* sp) {
+    auto cur = speedForPlayer(s.fake->m_playerSpeed);
+    if (cur == sp) return;
+    s.traceDx = s.traceDx * (sp->unitsPerSec / cur->unitsPerSec);
+    s.fake->m_playerSpeed = sp->playerSpeed;
 }
 
 // A smaller box in the middle of a hitbox (GD's "inner hitbox" for blocks).
@@ -506,8 +571,8 @@ static void waveStep(bool held) {
     s.fake->m_lastPosition = p;
     float slope = s.fake->m_vehicleSize < 0.9f ? 2.f : 1.f;
     float dir = (held ? 1.f : -1.f) * (s.fake->m_isUpsideDown ? -1.f : 1.f);
-    p.x += s.realDx;
-    p.y += dir * slope * s.realDx;
+    p.x += s.traceDx;
+    p.y += dir * slope * s.traceDx;
     setTracerPos(p);
 }
 
@@ -550,6 +615,10 @@ static bool waveCollide(CCRect const& before) {
 // Returns the tick it died on, or -1 if it survived.
 static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
                       std::chrono::steady_clock::time_point deadline) {
+    // A press is checked as exactly that one click: it can fire the orb you
+    // click on (GD gives a click a couple of ticks to catch an orb), but orbs
+    // reached later need a new click, so the tracer doesn't take them.
+    s.orbCutoff = down ? delay + 2 : -1;
     s.diagTicks = 0;
     s.diagCollChecks = 0;
     s.diagMaxObjs = 0;
@@ -567,6 +636,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     if (s.collideDt <= 0.f) { s.diagReason = "no collision dt"; return -1; }
     if (!ensureTracer(pl))  { s.diagReason = "no tracer"; return -1; }
     if (s.realDx < 0.01f)   { s.diagReason = "measuring your speed"; return -1; }
+    s.traceDx = s.realDx;
 
     // Wave: built-in wave physics, exact and independent of GD's player code.
     // Other modes: GD's own physics for height (jumps, gravity, orbs, pads) at
@@ -637,7 +707,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
             s.fake->m_lastPosition = p;
             setTracerPos(p);                      // both positions in sync before GD runs
             s.fake->update(stepDt);               // GD: jumps, gravity, orbs, pads
-            CCPoint np(p.x + s.realDx, pickNewY(p.y));
+            CCPoint np(p.x + s.traceDx, pickNewY(p.y));
             setTracerPos(np);                     // forward at your real speed
             pl->checkCollisions(s.fake, collDt, false);
             // Collisions may have moved it (landing on a block): keep that height.
@@ -656,6 +726,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     if (held) s.fake->releaseButton(PlayerButton::Jump);
     s.diagMovedX = s.fake->m_position.x - startPos.x;
     s.diagMovedY = s.fake->m_position.y - startPos.y;
+    s.orbCutoff = -1;
     s.builtinActive = false;
 
     // Put the level back exactly as it was.
@@ -1008,9 +1079,16 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             if (!obj) continue;
             auto type = obj->m_objectType;
 
+            // Speed portals only change the tracer's own speed.
+            if (auto sp = speedForPortal(obj->m_objectID)) {
+                if (playerRect.intersectsRect(obj->getObjectRect())) tracerHitSpeedPortal(sp);
+                continue;
+            }
+
             if (isSolidOrHazard(type)) {
                 kept.push_back(obj);
             } else if (isPlayerOnlyInteractable(type)) {
+                if (isOrb(type) && s.orbCutoff >= 0 && s.traceAhead > s.orbCutoff) continue;
                 rememberTouched(obj);
                 kept.push_back(obj);
             } else if (isLevelChangingPortal(type)) {
@@ -1067,9 +1145,13 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, debug panel ----------
+// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
+    struct Fields {
+        CCLabelBMFont* label = nullptr;
+    };
+
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         s.reset();
         s.fake = nullptr;
@@ -1080,7 +1162,17 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
+        if (assistEnabled()) m_isTestMode = true;
+
         auto win = CCDirector::get()->getWinSize();
+
+        auto label = CCLabelBMFont::create("", "bigFont.fnt");
+        label->setScale(0.35f);
+        label->setOpacity(180);
+        label->setAnchorPoint({1.f, 0.f});
+        label->setPosition({win.width - 5.f, 5.f});
+        m_uiLayer->addChild(label, 1000);
+        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1096,12 +1188,21 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
+        if (auto label = m_fields->label) {
+            label->setVisible(on);
+            if (on) {
+                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
+                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
+            }
+        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
+        // Safe mode: test mode stops progress and completions from saving.
+        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
