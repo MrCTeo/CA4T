@@ -95,6 +95,19 @@
         "input": true
       }
     },
+    "release-lookahead": {
+      "type": "int",
+      "name": "Release safety check (ticks)",
+      "description": "How many ticks after you let go the mod checks for a death, in every gamemode including wave. Falling into something after letting go early usually happens later than a click's death, so this can be longer than the wave safety check. Release Assist keeps using the normal safety check.",
+      "default": 20,
+      "min": 3,
+      "max": 360,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
     "wave-spam": {
       "type": "bool",
       "name": "Wave spam fix",
