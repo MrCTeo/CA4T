@@ -2,14 +2,13 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/ui/GeodeUI.hpp>
 #include <chrono>
 #include <deque>
 #include <unordered_map>
 
 using namespace geode::prelude;
-
-// Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v23";
 
 // =====================================================================
 // How it works
@@ -1068,13 +1067,9 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
+// ---------- play layer: tracer deaths, debug panel, safe mode ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
-    struct Fields {
-        CCLabelBMFont* label = nullptr;
-    };
-
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         s.reset();
         s.fake = nullptr;
@@ -1088,14 +1083,6 @@ class $modify(AssistPlayLayer, PlayLayer) {
         if (assistEnabled()) m_isTestMode = true;
 
         auto win = CCDirector::get()->getWinSize();
-
-        auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setOpacity(180);
-        label->setAnchorPoint({1.f, 0.f});
-        label->setPosition({win.width - 5.f, 5.f});
-        m_uiLayer->addChild(label, 1000);
-        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1111,13 +1098,6 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
-        if (auto label = m_fields->label) {
-            label->setVisible(on);
-            if (on) {
-                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
-                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
-            }
-        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
@@ -1141,5 +1121,26 @@ class $modify(AssistPlayLayer, PlayLayer) {
     void levelComplete() {
         if (s.tracing) { s.traceDone = true; return; }
         PlayLayer::levelComplete();
+    }
+};
+
+// ---------- pause menu: settings button ----------
+
+class $modify(AssistPause, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+
+        auto spr = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
+        spr->setScale(0.6f);
+        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(AssistPause::onAssistSettings));
+
+        auto menu = CCMenu::create();
+        menu->addChild(btn);
+        menu->setPosition({35.f, 35.f});
+        this->addChild(menu, 10);
+    }
+
+    void onAssistSettings(CCObject*) {
+        geode::openSettingsPopup(Mod::get());
     }
 };
