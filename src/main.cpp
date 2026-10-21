@@ -5,10 +5,15 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/ui/GeodeUI.hpp>
 #include <chrono>
+#include <cmath>
 #include <deque>
+#include <random>
 #include <unordered_map>
 
 using namespace geode::prelude;
+
+// Shown in the corner label so you can see which build is running.
+static constexpr char const* kBuildTag = "tracer-v32";
 
 // =====================================================================
 // How it works
@@ -43,6 +48,7 @@ static bool releaseAssist()  { return Mod::get()->getSettingValue<bool>("release
 static int  releaseAssistAfter() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-assist-after")); }
 static int  orbWindow()      { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-window")); }
 static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-catch")); }
+static bool randomPick()     { return Mod::get()->getSettingValue<bool>("random-pick"); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
 
@@ -59,6 +65,7 @@ struct PendingInput {
     bool spam = false;       // part of fast wave spam
     bool autoRelease = false; // made by Release Assist, not by you
     bool orb = false;        // a click on/near an orb
+    int safeCount = 0;       // how many safe ticks were found (random pick)
     bool checked = false;    // the tracer actually verified the chosen tick
 };
 
@@ -80,6 +87,14 @@ struct AssistState {
     int lastLook = 0;                    // safety check length used for the last input
     bool traceUsedOrb = false;           // the tracer's click fired an orb
     float prevTickX = 0.f;
+    float prevTickY = 0.f;
+    // Wave slope (vertical speed / horizontal speed), measured from your real
+    // wave. GD's documented values are 1 (45 deg) and 2 for mini (~63.43 deg);
+    // these start there and are refined from your actual movement.
+    // Measured separately for every case, so any difference between going up
+    // and going down is picked up: [mini][holding][upside down].
+    float waveSlope[2][2][2] = {{{1.f, 1.f}, {1.f, 1.f}}, {{2.f, 2.f}, {2.f, 2.f}}};
+    int waveSlopeN[2][2][2] = {};
     int prevTickNum = -1000;
     // Offset between your drawn position and your physics position.
     CCPoint nodeOffset = CCPointZero;
@@ -485,6 +500,32 @@ static void copyPlayerState(PlayerObject* dst, PlayerObject* src) {
     dst->setPosition(src->getPosition());
 }
 
+// ---------- wave slope measurement ----------
+
+// Learns the exact wave slope from your real wave, tick by tick. Ticks where
+// you slide along a floor, turn around mid-tick, or pass a portal don't match
+// the expected slope closely and are ignored.
+static void measureWaveSlope(PlayerObject* player, float dx, float dy) {
+    int mini = player->m_vehicleSize < 0.9f ? 1 : 0;
+    int held = s.heldInGame ? 1 : 0;
+    int flip = player->m_isUpsideDown ? 1 : 0;
+    float expected = mini ? 2.f : 1.f;
+    float ratio = std::abs(dy) / dx;
+    if (std::abs(ratio - expected) > 0.15f * expected) return;
+
+    float& slope = s.waveSlope[mini][held][flip];
+    int& n = s.waveSlopeN[mini][held][flip];
+    float weight = 1.f / static_cast<float>(std::min(n + 1, 100));
+    slope += (ratio - slope) * weight;
+    n += 1;
+    if (n == 30) {
+        bool goingUp = (held != 0) != (flip != 0);
+        debugLine(fmt::format("wave slope measured ({} {}): {:.4f} = {:.2f} deg",
+                              mini ? "mini" : "normal", goingUp ? "up" : "down", slope,
+                              std::atan(slope) * 180.f / 3.14159265f));
+    }
+}
+
 // ---------- tracer movement helpers ----------
 
 // Moves the tracer: physics position and drawn position together, keeping the
@@ -574,7 +615,8 @@ static void waveStep(bool held) {
     // GD checks collisions along the path from last tick's position, so that
     // has to be where the tracer really was one tick ago.
     s.fake->m_lastPosition = p;
-    float slope = s.fake->m_vehicleSize < 0.9f ? 2.f : 1.f;
+    float slope = s.waveSlope[s.fake->m_vehicleSize < 0.9f ? 1 : 0][held ? 1 : 0]
+                             [s.fake->m_isUpsideDown ? 1 : 0];
     float dir = (held ? 1.f : -1.f) * (s.fake->m_isUpsideDown ? -1.f : 1.f);
     p.x += s.traceDx;
     p.y += dir * slope * s.traceDx;
@@ -795,6 +837,12 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     in.foundSafe = false;
     in.firstDeath = -1;
 
+    // Random pick: when a click has to be moved, every tick in the window is
+    // checked and one of the safe ones is picked at random, instead of always
+    // the first. A click that's already safe on time is never moved.
+    bool collectAll = randomPick() && in.down && !in.spam && !in.autoRelease;
+    std::vector<int> safeTicks;
+
     for (int d = 0; d <= window; ++d) {
         int death = traceInput(pl, d, in.down, d + look, deadline);
         if (d == 0) {
@@ -806,10 +854,22 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
             }
         }
         // Couldn't check (see SKIPPED reason): send on time.
-        if (!s.diagReason.empty()) { chosen = 0; in.foundSafe = true; break; }
-        // Ran out of time before finding a safe tick: send on time.
-        if (s.diagTimedOut) { chosen = 0; in.foundSafe = false; break; }
-        if (death < 0) { chosen = d; in.foundSafe = true; in.checked = true; break; }
+        if (!s.diagReason.empty()) { chosen = 0; in.foundSafe = true; safeTicks.clear(); break; }
+        // Ran out of time: use the safe ticks found so far, otherwise on time.
+        if (s.diagTimedOut) { break; }
+        if (death < 0) {
+            if (d == 0 || !collectAll) { chosen = d; in.foundSafe = true; in.checked = true; safeTicks.clear(); break; }
+            safeTicks.push_back(d);
+        }
+    }
+
+    if (!safeTicks.empty()) {
+        static std::mt19937 rng{std::random_device{}()};
+        std::uniform_int_distribution<size_t> pick(0, safeTicks.size() - 1);
+        chosen = safeTicks[pick(rng)];
+        in.foundSafe = true;
+        in.checked = true;
+        in.safeCount = static_cast<int>(safeTicks.size());
     }
 
     s.planMs = std::chrono::duration<double, std::milli>(
@@ -826,7 +886,12 @@ static void logDecision(PendingInput const& in, int delay) {
     if (in.firstDeath < 0) {
         debugLine(fmt::format("{} +0 safe  ({:.2f}ms)", what, s.planMs));
     } else if (in.foundSafe) {
-        debugLine(fmt::format("{} dies@{} -> +{}  ({:.2f}ms)", what, in.firstDeath, delay, s.planMs));
+        if (in.safeCount > 1) {
+            debugLine(fmt::format("{} dies@{} -> +{} (random of {} safe)  ({:.2f}ms)",
+                                  what, in.firstDeath, delay, in.safeCount, s.planMs));
+        } else {
+            debugLine(fmt::format("{} dies@{} -> +{}  ({:.2f}ms)", what, in.firstDeath, delay, s.planMs));
+        }
     } else {
         debugLine(fmt::format("{} dies@{}, none safe -> on time  ({:.2f}ms)",
                               what, in.firstDeath, s.planMs));
@@ -1057,11 +1122,17 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         // next. This works no matter where in the tick GD moves the player.
         if (m_player1) {
             float x = m_player1->m_position.x;
+            float y = m_player1->m_position.y;
             if (s.prevTickNum == s.tick - 1) {
                 float dx = x - s.prevTickX;
-                if (dx > 0.01f && dx < 100.f) s.realDx = dx;   // ignore resets/teleports
+                float dy = y - s.prevTickY;
+                if (dx > 0.01f && dx < 100.f) {
+                    s.realDx = dx;   // ignore resets/teleports
+                    if (m_player1->m_isDart) measureWaveSlope(m_player1, dx, dy);
+                }
             }
             s.prevTickX = x;
+            s.prevTickY = y;
             s.prevTickNum = s.tick;
         }
 
@@ -1176,9 +1247,13 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, debug panel ----------
+// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
+    struct Fields {
+        CCLabelBMFont* label = nullptr;
+    };
+
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         s.reset();
         s.fake = nullptr;
@@ -1189,7 +1264,17 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
+        if (assistEnabled()) m_isTestMode = true;
+
         auto win = CCDirector::get()->getWinSize();
+
+        auto label = CCLabelBMFont::create("", "bigFont.fnt");
+        label->setScale(0.35f);
+        label->setOpacity(180);
+        label->setAnchorPoint({1.f, 0.f});
+        label->setPosition({win.width - 5.f, 5.f});
+        m_uiLayer->addChild(label, 1000);
+        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1205,12 +1290,21 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
+        if (auto label = m_fields->label) {
+            label->setVisible(on);
+            if (on) {
+                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
+                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
+            }
+        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
+        // Safe mode: test mode stops progress and completions from saving.
+        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
