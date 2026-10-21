@@ -6,9 +6,9 @@
     "mac": "2.2081"
   },
   "id": "yourname.click-assist",
-  "name": "Click Assist (Practice)",
+  "name": "Click Assist",
   "version": "v0.1.0",
-  "developer": "YourName",
+  "developer": "MrCTeo",
   "description": "Practice aid: an invisible tracer checks every press and release, and sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
   "settings": {
     "enabled": {
