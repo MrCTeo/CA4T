@@ -12,9 +12,6 @@
 
 using namespace geode::prelude;
 
-// Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v32";
-
 // =====================================================================
 // How it works
 //
@@ -48,6 +45,7 @@ static bool releaseAssist()  { return Mod::get()->getSettingValue<bool>("release
 static int  releaseAssistAfter() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-assist-after")); }
 static int  orbWindow()      { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-window")); }
 static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-catch")); }
+static int  checkTimeMs()    { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("check-time")); }
 static bool randomPick()     { return Mod::get()->getSettingValue<bool>("random-pick"); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
@@ -86,6 +84,7 @@ struct AssistState {
     int orbCutoff = -1;                  // after this trace tick, orbs need a new click
     int lastLook = 0;                    // safety check length used for the last input
     bool traceUsedOrb = false;           // the tracer's click fired an orb
+    bool nearInteractable = false;       // an orb/pad/portal was near the tracer last step
     float prevTickX = 0.f;
     float prevTickY = 0.f;
     // Wave slope (vertical speed / horizontal speed), measured from your real
@@ -667,6 +666,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     // reached later need a new click, so the tracer doesn't take them.
     s.orbCutoff = down ? delay + orbCatch() : -1;
     s.traceUsedOrb = false;
+    s.nearInteractable = false;
     s.diagTicks = 0;
     s.diagCollChecks = 0;
     s.diagMaxObjs = 0;
@@ -736,14 +736,22 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
         }
         s.traceAhead = t + 1;
         s.lastKept.clear();
+        bool nearBefore = s.nearInteractable;
+        s.nearInteractable = false;
         if (builtinWave) {
             CCRect before = tracerRect();
             // GD's player code applies orb/portal effects (gravity flips, size
             // changes) to the tracer; the position it computes is thrown away,
             // because the built-in wave movement is exact.
-            CCPoint keep = s.fake->m_position;
-            s.fake->update(stepDt);
-            setTracerPos(keep);
+            // GD's player code is only needed when an orb, pad or portal is near
+            // (gravity flips, size changes). Skipping it otherwise makes wave
+            // checks several times faster, so long release searches don't run
+            // out of time.
+            if (nearBefore || t == 0) {
+                CCPoint keep = s.fake->m_position;
+                s.fake->update(stepDt);
+                setTracerPos(keep);
+            }
             waveStep(held);
             pl->checkCollisions(s.fake, collDt, false);   // orbs, portals, moving objects
             if (!s.traceDied && waveCollide(before)) {
@@ -795,7 +803,10 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
 //  - ship and swing: nothing is checked
 //  - robot: presses are checked, releases are not
 static bool assistOff(PlayerObject* p, bool down) {
-    if (p->m_isShip || p->m_isSwing) return true;
+    if (p->m_isSwing) return true;
+    // Ship: only orb clicks are assisted (checked in planInput); ship releases
+    // and normal ship clicks go through untouched.
+    if (p->m_isShip && !down) return true;
     if (p->m_isRobot && !down) return true;
     return false;
 }
@@ -821,7 +832,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     }
 
     auto start = std::chrono::steady_clock::now();
-    auto deadline = start + std::chrono::microseconds(4000);
+    auto deadline = start + std::chrono::milliseconds(checkTimeMs());
 
     // How far ahead to look for a death after this input:
     //  - your releases: the release safety check (falling into something after
@@ -852,11 +863,23 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
                 window = orbWindow();
                 in.orb = true;
             }
+            // Ship: a click that doesn't use an orb is a normal ship click and
+            // goes through untouched. Only orb clicks get held back.
+            if (pl->m_player1->m_isShip && in.down && !in.orb && s.diagReason.empty()) {
+                in.skipped = true;
+                in.foundSafe = true;
+                in.firstDeath = -1;
+                chosen = 0;
+                break;
+            }
         }
         // Couldn't check (see SKIPPED reason): send on time.
         if (!s.diagReason.empty()) { chosen = 0; in.foundSafe = true; safeTicks.clear(); break; }
         // Ran out of time: use the safe ticks found so far, otherwise on time.
         if (s.diagTimedOut) { break; }
+        // Died before the input was even sent: every later tick shares that same
+        // path, so none of them can be safe. Stop here instead of wasting time.
+        if (death >= 0 && death < d) break;
         if (death < 0) {
             if (d == 0 || !collectAll) { chosen = d; in.foundSafe = true; in.checked = true; safeTicks.clear(); break; }
             safeTicks.push_back(d);
@@ -893,8 +916,9 @@ static void logDecision(PendingInput const& in, int delay) {
             debugLine(fmt::format("{} dies@{} -> +{}  ({:.2f}ms)", what, in.firstDeath, delay, s.planMs));
         }
     } else {
-        debugLine(fmt::format("{} dies@{}, none safe -> on time  ({:.2f}ms)",
-                              what, in.firstDeath, s.planMs));
+        debugLine(fmt::format("{} dies@{}, none safe -> on time  ({:.2f}ms){}",
+                              what, in.firstDeath, s.planMs,
+                              s.diagTimedOut ? "  OUT OF TIME" : ""));
     }
     debugDiag();
 }
@@ -1203,6 +1227,10 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             for (auto obj : kept) moveAhead(obj, s.traceAhead);
         }
 
+        for (auto obj : kept) {
+            if (isPlayerOnlyInteractable(obj->m_objectType)) { s.nearInteractable = true; break; }
+        }
+
         s.diagCollChecks++;
         s.diagMaxObjs = std::max(s.diagMaxObjs, static_cast<int>(kept.size()));
         GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
@@ -1247,13 +1275,9 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
+// ---------- play layer: tracer deaths, debug panel ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
-    struct Fields {
-        CCLabelBMFont* label = nullptr;
-    };
-
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         s.reset();
         s.fake = nullptr;
@@ -1264,17 +1288,7 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        if (assistEnabled()) m_isTestMode = true;
-
         auto win = CCDirector::get()->getWinSize();
-
-        auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setOpacity(180);
-        label->setAnchorPoint({1.f, 0.f});
-        label->setPosition({win.width - 5.f, 5.f});
-        m_uiLayer->addChild(label, 1000);
-        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1290,21 +1304,12 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
-        if (auto label = m_fields->label) {
-            label->setVisible(on);
-            if (on) {
-                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
-                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
-            }
-        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
-        // Safe mode: test mode stops progress and completions from saving.
-        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
