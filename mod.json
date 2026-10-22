@@ -127,6 +127,19 @@
         "input": true
       }
     },
+    "frame-budget": {
+      "type": "int",
+      "name": "Frame check budget (ms)",
+      "description": "Total time all checks may use within one drawn frame. In fast spam many inputs land in the same frame; this cap keeps them from adding up to frame drops. Inputs that come after the budget is used up are sent on time, unchecked.",
+      "default": 2,
+      "min": 1,
+      "max": 16,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
     "wave-spam": {
       "type": "bool",
       "name": "Wave spam fix",
