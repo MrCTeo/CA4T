@@ -75,6 +75,19 @@
       "description": "When a click has to be moved, check every tick in the window and pick one of the safe ones at random instead of always the first. Clicks that are already safe on time are never moved. Uses more time per click.",
       "default": false
     },
+    "edge-margin": {
+      "type": "int",
+      "name": "Edge margin (ticks)",
+      "description": "When an input has to be moved and several ticks in a row are safe, don't use the first one (it's right at the edge, where small prediction errors hurt most). Instead go into the middle of the safe run, up to this many ticks past its first safe tick. 0 = always the first safe tick.",
+      "default": 2,
+      "min": 0,
+      "max": 5,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
     "lookahead": {
       "type": "int",
       "name": "Safety check (ticks)",
