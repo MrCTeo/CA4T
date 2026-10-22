@@ -12,6 +12,9 @@
 
 using namespace geode::prelude;
 
+// Shown in the corner label so you can see which build is running.
+static constexpr char const* kBuildTag = "tracer-v34";
+
 // =====================================================================
 // How it works
 //
@@ -1275,9 +1278,13 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, debug panel ----------
+// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
+    struct Fields {
+        CCLabelBMFont* label = nullptr;
+    };
+
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         s.reset();
         s.fake = nullptr;
@@ -1288,7 +1295,17 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
+        if (assistEnabled()) m_isTestMode = true;
+
         auto win = CCDirector::get()->getWinSize();
+
+        auto label = CCLabelBMFont::create("", "bigFont.fnt");
+        label->setScale(0.35f);
+        label->setOpacity(180);
+        label->setAnchorPoint({1.f, 0.f});
+        label->setPosition({win.width - 5.f, 5.f});
+        m_uiLayer->addChild(label, 1000);
+        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1304,12 +1321,21 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
+        if (auto label = m_fields->label) {
+            label->setVisible(on);
+            if (on) {
+                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
+                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
+            }
+        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
+        // Safe mode: test mode stops progress and completions from saving.
+        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
