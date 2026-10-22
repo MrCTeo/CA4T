@@ -9,11 +9,12 @@
 #include <deque>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace geode::prelude;
 
 // Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v32";
+static constexpr char const* kBuildTag = "tracer-v37";
 
 // =====================================================================
 // How it works
@@ -48,6 +49,8 @@ static bool releaseAssist()  { return Mod::get()->getSettingValue<bool>("release
 static int  releaseAssistAfter() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-assist-after")); }
 static int  orbWindow()      { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-window")); }
 static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-catch")); }
+static int  checkTimeMs()    { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("check-time")); }
+static int  frameBudgetMs()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("frame-budget")); }
 static bool randomPick()     { return Mod::get()->getSettingValue<bool>("random-pick"); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
@@ -86,6 +89,12 @@ struct AssistState {
     int orbCutoff = -1;                  // after this trace tick, orbs need a new click
     int lastLook = 0;                    // safety check length used for the last input
     bool traceUsedOrb = false;           // the tracer's click fired an orb
+    bool nearInteractable = false;       // an orb/pad/portal was near the tracer last step
+
+    // Performance
+    bool debugOn = false;                // debug panel setting, cached once per tick
+    unsigned int budgetFrame = 0;        // which drawn frame the budget below is for
+    double budgetUsedMs = 0.0;           // checking time already spent this frame
     float prevTickX = 0.f;
     float prevTickY = 0.f;
     // Wave slope (vertical speed / horizontal speed), measured from your real
@@ -100,6 +109,9 @@ struct AssistState {
     CCPoint nodeOffset = CCPointZero;
     bool builtinActive = false;          // current trace uses built-in wave physics
     std::vector<GameObject*> lastKept;   // objects near the tracer this step
+    // Noclip: spikes/blocks you're already inside when a prediction starts.
+    // They don't count as deaths for that prediction; only new contacts do.
+    std::unordered_set<GameObject*> startOverlap;
 
     // Inputs
     std::deque<PendingInput> queue;
@@ -181,6 +193,10 @@ static AssistState s;
 // ---------- debug panel ----------
 
 static void debugLine(std::string const& line) {
+    // Panel text and log lines are only produced with the debug panel on:
+    // rebuilding the text and writing the log on every spam input was a big
+    // part of the frame drops.
+    if (!s.debugOn) return;
     if (line.rfind("   ", 0) != 0) log::info("[CA] {}", line);
     s.lines.push_back(line);
     while (s.lines.size() > 8) s.lines.pop_front();
@@ -191,6 +207,7 @@ static void debugLine(std::string const& line) {
 }
 
 static void debugDiag() {
+    if (!s.debugOn) return;
     if (!s.diagReason.empty()) {
         debugLine("   SKIPPED: " + s.diagReason);
         log::info("[CA]    SKIPPED: {}", s.diagReason);
@@ -604,6 +621,10 @@ static float pickNewY(float y) {
     return y;
 }
 
+static bool startedInside(GameObject* obj) {
+    return obj && s.startOverlap.count(obj) != 0;
+}
+
 // ---------- built-in wave physics ----------
 //
 // Wave is simple enough to simulate exactly: it moves forward at your speed and
@@ -626,6 +647,7 @@ static void waveStep(bool held) {
 // Returns true if the tracer dies against the objects near it.
 static bool waveCollide(CCRect const& before) {
     for (auto obj : s.lastKept) {
+        if (startedInside(obj)) continue;
         auto type = obj->m_objectType;
         auto r = obj->getObjectRect();
         auto outer = tracerRect();
@@ -667,6 +689,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     // reached later need a new click, so the tracer doesn't take them.
     s.orbCutoff = down ? delay + orbCatch() : -1;
     s.traceUsedOrb = false;
+    s.nearInteractable = false;
     s.diagTicks = 0;
     s.diagCollChecks = 0;
     s.diagMaxObjs = 0;
@@ -722,12 +745,31 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     // pass at your current position first lets the tracer "touch" the orb you're
     // in, exactly like you already have.
     s.traceAhead = 0;
+    s.lastKept.clear();
+    s.startOverlap.clear();
     pl->checkCollisions(s.fake, collDt, false);
     int death = -1;
     // A death in this setup pass isn't a real prediction (you're alive right
     // now), so it's ignored. Only deaths after the tracer actually moves count.
     s.traceDied = false;
 
+    // Noclip: remember everything you're already inside right now (spikes you
+    // overlap, blocks your inner hitbox is in). Without noclip this list is
+    // always empty, because you'd already be dead.
+    {
+        auto outer = tracerRect();
+        auto inner = innerRect(outer, 0.3f);
+        for (auto obj : s.lastKept) {
+            auto type = obj->m_objectType;
+            auto r = obj->getObjectRect();
+            if ((type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard)
+                && outer.intersectsRect(r)) s.startOverlap.insert(obj);
+            else if (type == GameObjectType::Solid && inner.intersectsRect(r))
+                s.startOverlap.insert(obj);
+        }
+    }
+
+    bool movingOn = predictMoving();
     for (int t = 0; t < maxTicks && death < 0; ++t) {
         if (t == delay && held != down) {
             if (down) s.fake->pushButton(PlayerButton::Jump);
@@ -735,22 +777,39 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
             held = down;
         }
         s.traceAhead = t + 1;
-        s.lastKept.clear();
+        bool nearBefore = s.nearInteractable;
         if (builtinWave) {
             CCRect before = tracerRect();
-            // GD's player code applies orb/portal effects (gravity flips, size
-            // changes) to the tracer; the position it computes is thrown away,
-            // because the built-in wave movement is exact.
-            CCPoint keep = s.fake->m_position;
-            s.fake->update(stepDt);
-            setTracerPos(keep);
+            // GD's player code is only needed when an orb, pad or portal is near
+            // (gravity flips, size changes); the position it computes is thrown
+            // away, because the built-in wave movement is exact.
+            if (nearBefore || t == 0) {
+                CCPoint keep = s.fake->m_position;
+                s.fake->update(stepDt);
+                setTracerPos(keep);
+            }
             waveStep(held);
-            pl->checkCollisions(s.fake, collDt, false);   // orbs, portals, moving objects
+
+            // Asking GD for the objects around the tracer is the expensive part.
+            // Nearby objects barely change from one tick to the next, so the
+            // list is only refreshed every 4 ticks, or every tick when an orb,
+            // pad or portal is near (so those still fire on the right tick).
+            // Moving objects are still moved to their predicted spot every tick.
+            bool refresh = nearBefore || t == 0 || (t & 3) == 0;
+            if (refresh) {
+                s.lastKept.clear();
+                s.nearInteractable = false;
+                pl->checkCollisions(s.fake, collDt, false);   // orbs, portals, moving objects
+            } else if (movingOn) {
+                for (auto obj : s.lastKept) moveAhead(obj, s.traceAhead);
+            }
             if (!s.traceDied && waveCollide(before)) {
                 s.traceDied = true;
                 s.diagFallbackDeaths++;
             }
         } else {
+            s.lastKept.clear();
+            s.nearInteractable = false;
             CCPoint p = s.fake->m_position;
             s.fake->m_lastPosition = p;
             setTracerPos(p);                      // both positions in sync before GD runs
@@ -795,7 +854,10 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
 //  - ship and swing: nothing is checked
 //  - robot: presses are checked, releases are not
 static bool assistOff(PlayerObject* p, bool down) {
-    if (p->m_isShip || p->m_isSwing) return true;
+    if (p->m_isSwing) return true;
+    // Ship: only orb clicks are assisted (checked in planInput); ship releases
+    // and normal ship clicks go through untouched.
+    if (p->m_isShip && !down) return true;
     if (p->m_isRobot && !down) return true;
     return false;
 }
@@ -821,7 +883,28 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     }
 
     auto start = std::chrono::steady_clock::now();
-    auto deadline = start + std::chrono::microseconds(4000);
+
+    // Frame budget: all checks within one drawn frame share this much time.
+    // In fast spam, many inputs land in the same frame; without a shared cap
+    // their checks added up to long freezes.
+    unsigned int frame = CCDirector::get()->getTotalFrames();
+    if (frame != s.budgetFrame) {
+        s.budgetFrame = frame;
+        s.budgetUsedMs = 0.0;
+    }
+    double leftMs = static_cast<double>(frameBudgetMs()) - s.budgetUsedMs;
+    if (leftMs <= 0.2) {
+        // Out of time for this frame: send on time, unchecked.
+        s.diagReason = "frame budget used up";
+        in.foundSafe = true;
+        in.firstDeath = -1;
+        s.planMs = 0.0;
+        return 0;
+    }
+    double limitMs = std::min(static_cast<double>(checkTimeMs()), leftMs);
+    // Spam inputs can only move a tick or so anyway, so they get a short check.
+    if (in.spam) limitMs = std::min(limitMs, 0.75);
+    auto deadline = start + std::chrono::microseconds(static_cast<long long>(limitMs * 1000.0));
 
     // How far ahead to look for a death after this input:
     //  - your releases: the release safety check (falling into something after
@@ -852,11 +935,23 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
                 window = orbWindow();
                 in.orb = true;
             }
+            // Ship: a click that doesn't use an orb is a normal ship click and
+            // goes through untouched. Only orb clicks get held back.
+            if (pl->m_player1->m_isShip && in.down && !in.orb && s.diagReason.empty()) {
+                in.skipped = true;
+                in.foundSafe = true;
+                in.firstDeath = -1;
+                chosen = 0;
+                break;
+            }
         }
         // Couldn't check (see SKIPPED reason): send on time.
         if (!s.diagReason.empty()) { chosen = 0; in.foundSafe = true; safeTicks.clear(); break; }
         // Ran out of time: use the safe ticks found so far, otherwise on time.
         if (s.diagTimedOut) { break; }
+        // Died before the input was even sent: every later tick shares that same
+        // path, so none of them can be safe. Stop here instead of wasting time.
+        if (death >= 0 && death < d) break;
         if (death < 0) {
             if (d == 0 || !collectAll) { chosen = d; in.foundSafe = true; in.checked = true; safeTicks.clear(); break; }
             safeTicks.push_back(d);
@@ -874,11 +969,12 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
 
     s.planMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
+    s.budgetUsedMs += s.planMs;
     return chosen;
 }
 
 static void logDecision(PendingInput const& in, int delay) {
-    if (in.skipped) return;
+    if (in.skipped || !s.debugOn) return;
     char const* what = in.autoRelease ? "auto-release"
                      : in.orb ? "orb    "
                      : in.spam ? (in.down ? "press* " : "release*")
@@ -893,8 +989,9 @@ static void logDecision(PendingInput const& in, int delay) {
             debugLine(fmt::format("{} dies@{} -> +{}  ({:.2f}ms)", what, in.firstDeath, delay, s.planMs));
         }
     } else {
-        debugLine(fmt::format("{} dies@{}, none safe -> on time  ({:.2f}ms)",
-                              what, in.firstDeath, s.planMs));
+        debugLine(fmt::format("{} dies@{}, none safe -> on time  ({:.2f}ms){}",
+                              what, in.firstDeath, s.planMs,
+                              s.diagTimedOut ? "  OUT OF TIME" : ""));
     }
     debugDiag();
 }
@@ -1118,6 +1215,8 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         if (s.tracing || !assistEnabled() || !isActivePlayLayer()) {
             return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         }
+        s.debugOn = debugPanel();
+
         // Measure how far you really move per tick, from one tick's start to the
         // next. This works no matter where in the tick GD moves the player.
         if (m_player1) {
@@ -1203,6 +1302,10 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             for (auto obj : kept) moveAhead(obj, s.traceAhead);
         }
 
+        for (auto obj : kept) {
+            if (isPlayerOnlyInteractable(obj->m_objectType)) { s.nearInteractable = true; break; }
+        }
+
         s.diagCollChecks++;
         s.diagMaxObjs = std::max(s.diagMaxObjs, static_cast<int>(kept.size()));
         GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
@@ -1218,6 +1321,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             auto outer = tracerRect();
             auto inner = innerRect(outer, 0.3f);
             for (auto obj : kept) {
+                if (startedInside(obj)) continue;
                 auto type = obj->m_objectType;
                 bool hit = false;
                 if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) {
@@ -1311,7 +1415,7 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
         if (s.tracing) {
-            if (player == s.fake) s.traceDied = true;
+            if (player == s.fake && !startedInside(obj)) s.traceDied = true;
             return;
         }
         PlayLayer::destroyPlayer(player, obj);
