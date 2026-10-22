@@ -13,9 +13,6 @@
 
 using namespace geode::prelude;
 
-// Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v37";
-
 // =====================================================================
 // How it works
 //
@@ -51,6 +48,7 @@ static int  orbWindow()      { return static_cast<int>(Mod::get()->getSettingVal
 static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-catch")); }
 static int  checkTimeMs()    { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("check-time")); }
 static int  frameBudgetMs()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("frame-budget")); }
+static int  edgeMargin()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("edge-margin")); }
 static bool randomPick()     { return Mod::get()->getSettingValue<bool>("random-pick"); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
@@ -68,7 +66,8 @@ struct PendingInput {
     bool spam = false;       // part of fast wave spam
     bool autoRelease = false; // made by Release Assist, not by you
     bool orb = false;        // a click on/near an orb
-    int safeCount = 0;       // how many safe ticks were found (random pick)
+    int safeCount = 0;       // how many safe ticks were found (random pick / safe run)
+    bool edgeRun = false;    // chosen from the middle of a run of safe ticks
     bool checked = false;    // the tracer actually verified the chosen tick
 };
 
@@ -90,6 +89,7 @@ struct AssistState {
     int lastLook = 0;                    // safety check length used for the last input
     bool traceUsedOrb = false;           // the tracer's click fired an orb
     bool nearInteractable = false;       // an orb/pad/portal was near the tracer last step
+    bool nearSlope = false;              // a slope was near the tracer last step
 
     // Performance
     bool debugOn = false;                // debug panel setting, cached once per tick
@@ -645,6 +645,53 @@ static void waveStep(bool held) {
 }
 
 // Returns true if the tracer dies against the objects near it.
+// ---------- slopes ----------
+// A slope's solid part is a right triangle inside its box. Unrotated and
+// unflipped, it fills the bottom-right half (a ramp rising to the right).
+// Flips and 90-degree rotations move that triangle around the box.
+struct Tri { CCPoint p[3]; };
+
+static Tri slopeTriangle(GameObject* obj) {
+    auto r = obj->getObjectRect();
+    float rot = std::fmod(std::fmod(obj->getRotation(), 360.f) + 360.f, 360.f);
+    int quarter = static_cast<int>(std::lround(rot / 90.f)) % 4;
+    float w = r.size.width, h = r.size.height;
+    if (quarter % 2 == 1) std::swap(w, h);   // the box was measured after rotating
+    bool fx = obj->isFlipX() || obj->getScaleX() < 0.f;
+    bool fy = obj->isFlipY() || obj->getScaleY() < 0.f;
+    CCPoint local[3] = {CCPoint(-w / 2.f, -h / 2.f), CCPoint(w / 2.f, -h / 2.f), CCPoint(w / 2.f, h / 2.f)};
+    CCPoint center(r.getMidX(), r.getMidY());
+    Tri t;
+    for (int i = 0; i < 3; ++i) {
+        float x = local[i].x * (fx ? -1.f : 1.f);
+        float y = local[i].y * (fy ? -1.f : 1.f);
+        for (int q = 0; q < quarter; ++q) {   // GD rotation is clockwise
+            float nx = y, ny = -x;
+            x = nx; y = ny;
+        }
+        t.p[i] = CCPoint(center.x + x, center.y + y);
+    }
+    return t;
+}
+
+// True if the triangle and the box overlap (separating axis test).
+static bool triOverlapsRect(Tri const& t, CCRect const& r) {
+    CCPoint rp[4] = {CCPoint(r.getMinX(), r.getMinY()), CCPoint(r.getMaxX(), r.getMinY()),
+                     CCPoint(r.getMaxX(), r.getMaxY()), CCPoint(r.getMinX(), r.getMaxY())};
+    auto separated = [&](CCPoint axis) {
+        float a0 = 1e30f, a1 = -1e30f, b0 = 1e30f, b1 = -1e30f;
+        for (auto& p : t.p) { float d = p.x * axis.x + p.y * axis.y; a0 = std::min(a0, d); a1 = std::max(a1, d); }
+        for (auto& p : rp)  { float d = p.x * axis.x + p.y * axis.y; b0 = std::min(b0, d); b1 = std::max(b1, d); }
+        return a1 < b0 || b1 < a0;
+    };
+    if (separated(CCPoint(1.f, 0.f)) || separated(CCPoint(0.f, 1.f))) return false;
+    for (int i = 0; i < 3; ++i) {
+        CCPoint e = t.p[(i + 1) % 3] - t.p[i];
+        if (separated(CCPoint(-e.y, e.x))) return false;
+    }
+    return true;
+}
+
 static bool waveCollide(CCRect const& before) {
     for (auto obj : s.lastKept) {
         if (startedInside(obj)) continue;
@@ -655,6 +702,12 @@ static bool waveCollide(CCRect const& before) {
 
         if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) {
             return true;
+        }
+        if (type == GameObjectType::Slope) {
+            // Sliding along a slope only touches it with the edge of the hitbox;
+            // flying into its face pushes the inner hitbox into the triangle.
+            if (triOverlapsRect(slopeTriangle(obj), innerRect(outer, 0.3f))) return true;
+            continue;
         }
         if (type == GameObjectType::Solid) {
             float top = r.getMaxY(), bottom = r.getMinY();
@@ -690,6 +743,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     s.orbCutoff = down ? delay + orbCatch() : -1;
     s.traceUsedOrb = false;
     s.nearInteractable = false;
+    s.nearSlope = false;
     s.diagTicks = 0;
     s.diagCollChecks = 0;
     s.diagMaxObjs = 0;
@@ -795,10 +849,13 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
             // list is only refreshed every 4 ticks, or every tick when an orb,
             // pad or portal is near (so those still fire on the right tick).
             // Moving objects are still moved to their predicted spot every tick.
-            bool refresh = nearBefore || t == 0 || (t & 3) == 0;
+            // Slopes are checked against their exact shape, so near slopes the
+            // object list is refreshed every tick as well.
+            bool refresh = nearBefore || s.nearSlope || t == 0 || (t & 3) == 0;
             if (refresh) {
                 s.lastKept.clear();
                 s.nearInteractable = false;
+                s.nearSlope = false;
                 pl->checkCollisions(s.fake, collDt, false);   // orbs, portals, moving objects
             } else if (movingOn) {
                 for (auto obj : s.lastKept) moveAhead(obj, s.traceAhead);
@@ -926,6 +983,14 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     bool collectAll = randomPick() && in.down && !in.spam && !in.autoRelease;
     std::vector<int> safeTicks;
 
+    // Edge margin: when an input has to be moved, the first safe tick is right
+    // at the edge of the safe zone, where small prediction errors hurt most.
+    // So the search continues through the safe ticks that follow, and the input
+    // goes to the middle of that safe run (up to `margin` ticks in).
+    int margin = in.spam ? 0 : edgeMargin();
+    int runStart = -1;
+    int runLen = 0;
+
     for (int d = 0; d <= window; ++d) {
         int death = traceInput(pl, d, in.down, d + look, deadline);
         if (d == 0) {
@@ -952,10 +1017,31 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
         // Died before the input was even sent: every later tick shares that same
         // path, so none of them can be safe. Stop here instead of wasting time.
         if (death >= 0 && death < d) break;
-        if (death < 0) {
-            if (d == 0 || !collectAll) { chosen = d; in.foundSafe = true; in.checked = true; safeTicks.clear(); break; }
-            safeTicks.push_back(d);
+
+        // Already inside a safe run: extend it, or stop at its end.
+        if (runStart >= 0) {
+            if (death >= 0) break;
+            runLen++;
+            if (runLen >= 2 * margin + 1) break;   // enough room to sit `margin` ticks in
+            continue;
         }
+
+        if (death < 0) {
+            if (d == 0) { chosen = 0; in.foundSafe = true; in.checked = true; safeTicks.clear(); break; }
+            if (collectAll) { safeTicks.push_back(d); continue; }
+            if (margin <= 0) { chosen = d; in.foundSafe = true; in.checked = true; break; }
+            runStart = d;
+            runLen = 1;
+        }
+    }
+
+    if (runStart >= 0) {
+        // Middle of the safe run, at most `margin` ticks past its first tick.
+        chosen = runStart + std::min(margin, (runLen - 1) / 2);
+        in.foundSafe = true;
+        in.checked = true;
+        in.safeCount = runLen;
+        in.edgeRun = true;
     }
 
     if (!safeTicks.empty()) {
@@ -982,7 +1068,10 @@ static void logDecision(PendingInput const& in, int delay) {
     if (in.firstDeath < 0) {
         debugLine(fmt::format("{} +0 safe  ({:.2f}ms)", what, s.planMs));
     } else if (in.foundSafe) {
-        if (in.safeCount > 1) {
+        if (in.edgeRun) {
+            debugLine(fmt::format("{} dies@{} -> +{} (safe run of {})  ({:.2f}ms)",
+                                  what, in.firstDeath, delay, in.safeCount, s.planMs));
+        } else if (in.safeCount > 1) {
             debugLine(fmt::format("{} dies@{} -> +{} (random of {} safe)  ({:.2f}ms)",
                                   what, in.firstDeath, delay, in.safeCount, s.planMs));
         } else {
@@ -1303,7 +1392,8 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         }
 
         for (auto obj : kept) {
-            if (isPlayerOnlyInteractable(obj->m_objectType)) { s.nearInteractable = true; break; }
+            if (isPlayerOnlyInteractable(obj->m_objectType)) s.nearInteractable = true;
+            if (obj->m_objectType == GameObjectType::Slope) s.nearSlope = true;
         }
 
         s.diagCollChecks++;
@@ -1351,13 +1441,9 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
+// ---------- play layer: tracer deaths, debug panel ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
-    struct Fields {
-        CCLabelBMFont* label = nullptr;
-    };
-
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         s.reset();
         s.fake = nullptr;
@@ -1368,17 +1454,7 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        if (assistEnabled()) m_isTestMode = true;
-
         auto win = CCDirector::get()->getWinSize();
-
-        auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setOpacity(180);
-        label->setAnchorPoint({1.f, 0.f});
-        label->setPosition({win.width - 5.f, 5.f});
-        m_uiLayer->addChild(label, 1000);
-        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1394,21 +1470,12 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
-        if (auto label = m_fields->label) {
-            label->setVisible(on);
-            if (on) {
-                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
-                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
-            }
-        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
-        // Safe mode: test mode stops progress and completions from saving.
-        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
