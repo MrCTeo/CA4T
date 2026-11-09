@@ -204,6 +204,12 @@
         "input": true
       }
     },
+    "ship-assist": {
+      "type": "bool",
+      "name": "Ship assist",
+      "description": "Check ship clicks and releases like the other gamemodes, so they can be held back to a safe tick. When off, only orb clicks in ship are assisted. Release Assist never lets go for you in ship either way.",
+      "default": false
+    },
     "predict-moving": {
       "type": "bool",
       "name": "Predict moving objects",
