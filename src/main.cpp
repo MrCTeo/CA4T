@@ -13,9 +13,6 @@
 
 using namespace geode::prelude;
 
-// Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v40";
-
 // =====================================================================
 // How it works
 //
@@ -52,6 +49,7 @@ static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingVal
 static int  checkTimeMs()    { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("check-time")); }
 static int  frameBudgetMs()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("frame-budget")); }
 static int  edgeMargin()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("edge-margin")); }
+static bool shipAssist()     { return Mod::get()->getSettingValue<bool>("ship-assist"); }
 static bool randomPick()     { return Mod::get()->getSettingValue<bool>("random-pick"); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
 static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
@@ -915,9 +913,9 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
 //  - robot: presses are checked, releases are not
 static bool assistOff(PlayerObject* p, bool down) {
     if (p->m_isSwing) return true;
-    // Ship: only orb clicks are assisted (checked in planInput); ship releases
-    // and normal ship clicks go through untouched.
-    if (p->m_isShip && !down) return true;
+    // Ship: with Ship assist on, ship clicks and releases are checked like any
+    // other mode. With it off, only orb clicks are assisted (see planInput).
+    if (p->m_isShip && !down && !shipAssist()) return true;
     if (p->m_isRobot && !down) return true;
     return false;
 }
@@ -1005,7 +1003,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
             }
             // Ship: a click that doesn't use an orb is a normal ship click and
             // goes through untouched. Only orb clicks get held back.
-            if (pl->m_player1->m_isShip && in.down && !in.orb && s.diagReason.empty()) {
+            if (pl->m_player1->m_isShip && !shipAssist() && in.down && !in.orb && s.diagReason.empty()) {
                 in.skipped = true;
                 in.foundSafe = true;
                 in.firstDeath = -1;
@@ -1220,7 +1218,8 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
         if (m_gameState.m_isDualMode) return;
         auto pl = PlayLayer::get();
         auto p = pl->m_player1;
-        if (p->m_isPlatformer || assistOff(p, false)) return;      // ship, swing, robot
+        // Release Assist never lets go for you in ship: holding is how ship flies.
+        if (p->m_isPlatformer || p->m_isShip || assistOff(p, false)) return;   // ship, swing, robot
         if (s.tick - s.holdStartTick < releaseAssistAfter()) return;
         if (s.tick < s.nextAutoCheck) return;
 
@@ -1444,13 +1443,9 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
+// ---------- play layer: tracer deaths, debug panel ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
-    struct Fields {
-        CCLabelBMFont* label = nullptr;
-    };
-
     // The tracer's "deaths" go through GD's death function. Other mods that
     // hook it (noclip death counters, death sounds, accuracy trackers) would
     // count those as your deaths. Running this mod's hook first means a
@@ -1475,17 +1470,7 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        if (assistEnabled()) m_isTestMode = true;
-
         auto win = CCDirector::get()->getWinSize();
-
-        auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setOpacity(180);
-        label->setAnchorPoint({1.f, 0.f});
-        label->setPosition({win.width - 5.f, 5.f});
-        m_uiLayer->addChild(label, 1000);
-        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1501,21 +1486,12 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
-        if (auto label = m_fields->label) {
-            label->setVisible(on);
-            if (on) {
-                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
-                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
-            }
-        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
-        // Safe mode: test mode stops progress and completions from saving.
-        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
