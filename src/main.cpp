@@ -92,6 +92,15 @@ struct AssistState {
     bool nearInteractable = false;       // an orb/pad/portal was near the tracer last step
     bool nearSlope = false;              // a slope was near the tracer last step
 
+    // Tracer collisions run in GD's "ignore damage" mode, so GD never calls
+    // its death function for the tracer: noclip death counters and other mods
+    // never see tracer deaths. The mod's own hitbox checks detect them instead.
+    // If your GD skips object collisions entirely in that mode, the mod notices
+    // and switches back.
+    bool ignoreDamage = true;
+    int ignoreDamageEmpty = 0;           // setup passes in a row that saw no objects
+    bool ignoreDamageDecided = false;
+
     // Performance
     bool debugOn = false;                // debug panel setting, cached once per tick
     unsigned int budgetFrame = 0;        // which drawn frame the budget below is for
@@ -802,7 +811,18 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     s.traceAhead = 0;
     s.lastKept.clear();
     s.startOverlap.clear();
-    pl->checkCollisions(s.fake, collDt, false);
+    pl->checkCollisions(s.fake, collDt, s.ignoreDamage);
+    if (!s.ignoreDamageDecided) {
+        if (s.diagCollChecks > 0) {
+            s.ignoreDamageDecided = true;   // object checks run in this mode: keep it
+        } else if (++s.ignoreDamageEmpty >= 5) {
+            s.ignoreDamage = false;         // they don't: fall back to the normal mode
+            s.ignoreDamageDecided = true;
+            log::info("[CA] ignore-damage collisions see no objects, using normal collisions");
+            s.lastKept.clear();
+            pl->checkCollisions(s.fake, collDt, false);
+        }
+    }
     int death = -1;
     // A death in this setup pass isn't a real prediction (you're alive right
     // now), so it's ignored. Only deaths after the tracer actually moves count.
@@ -857,7 +877,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
                 s.lastKept.clear();
                 s.nearInteractable = false;
                 s.nearSlope = false;
-                pl->checkCollisions(s.fake, collDt, false);   // orbs, portals, moving objects
+                pl->checkCollisions(s.fake, collDt, s.ignoreDamage);   // orbs, portals, moving objects
             } else if (movingOn) {
                 for (auto obj : s.lastKept) moveAhead(obj, s.traceAhead);
             }
@@ -874,7 +894,7 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
             s.fake->update(stepDt);               // GD: jumps, gravity, orbs, pads
             CCPoint np(p.x + s.traceDx, pickNewY(p.y));
             setTracerPos(np);                     // forward at your real speed
-            pl->checkCollisions(s.fake, collDt, false);
+            pl->checkCollisions(s.fake, collDt, s.ignoreDamage);
             // Collisions may have moved it (landing on a block): keep that height.
             setTracerPos(CCPoint(np.x, pickNewY(np.y)));
         }
@@ -1262,7 +1282,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
 
         s.tracing = true;
         s.scouting = true;
-        pl->checkCollisions(s.fake, s.collideDt, true);
+        pl->checkCollisions(s.fake, s.collideDt, s.ignoreDamage);
         s.scouting = false;
         s.tracing = false;
         s.traceDied = false;
@@ -1420,6 +1440,8 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
                     hit = outer.intersectsRect(obj->getObjectRect());
                 } else if (type == GameObjectType::Solid) {
                     hit = inner.intersectsRect(obj->getObjectRect());
+                } else if (type == GameObjectType::Slope) {
+                    hit = triOverlapsRect(slopeTriangle(obj), inner);
                 }
                 if (hit) {
                     s.traceDied = true;
