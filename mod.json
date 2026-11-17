@@ -1,1645 +1,245 @@
-#include <Geode/Geode.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/PauseLayer.hpp>
-#include <Geode/ui/GeodeUI.hpp>
-#include <chrono>
-#include <cmath>
-#include <deque>
-#include <random>
-#include <unordered_map>
-#include <unordered_set>
-
-using namespace geode::prelude;
-
-// Shown in the corner label so you can see which build is running.
-static constexpr char const* kBuildTag = "tracer-v44";
-
-// =====================================================================
-// How it works
-//
-// Every input (press AND release) is checked by an invisible tracer: a copy
-// of your player that flies ahead along the trajectory that input would give
-// you. It tries the input on tick +0, +1, ... up to the search window, and
-// the input is sent on the first tick where the tracer doesn't die.
-// If no tick in the window is safe, the input is sent on time, unchanged.
-//
-// Releases are checked too. On wave a release is just as deadly as a press,
-// so both directions are covered. The tracer uses orbs, pads and gravity/size
-// portals like you would, and puts them back untouched after every check.
-//
-// The tracer never touches the real game: no snapshots, no rewinds, no wave
-// trail resets, no physics changes. Safe inputs go through with zero delay.
-// =====================================================================
-
-// ---------- settings ----------
-
-static bool assistEnabled()  { return Mod::get()->getSettingValue<bool>("enabled"); }
-static int  assistWindow()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("window")); }
-static int  releaseWindow()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-window")); }
-static int  lookaheadTicks() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("lookahead")); }
-static int  releaseLookahead() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-lookahead")); }
-static int  waveLookahead()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead")); }
-static bool waveSpamFix()    { return Mod::get()->getSettingValue<bool>("wave-spam"); }
-static int  spamGap()        { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-gap")); }
-static int  spamMaxDelay()   { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-max-delay")); }
-static bool predictMoving()  { return Mod::get()->getSettingValue<bool>("predict-moving"); }
-static bool releaseAssist()  { return Mod::get()->getSettingValue<bool>("release-assist"); }
-static int  releaseAssistAfter() { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("release-assist-after")); }
-static int  orbWindow()      { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-window")); }
-static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("orb-catch")); }
-static int  checkTimeMs()    { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("check-time")); }
-static int  frameBudgetMs()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("frame-budget")); }
-static int  edgeMargin()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("edge-margin")); }
-static bool dualAssist()     { return Mod::get()->getSettingValue<bool>("dual-assist"); }
-static bool shipAssist()     { return Mod::get()->getSettingValue<bool>("ship-assist"); }
-static bool randomPick()     { return Mod::get()->getSettingValue<bool>("random-pick"); }
-static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
-static bool debugPanel()     { return Mod::get()->getSettingValue<bool>("debug"); }
-
-// ---------- state ----------
-
-struct PendingInput {
-    bool down = true;
-    int realTick = 0;        // tick you actually pressed/released
-    int base = 0;            // earliest tick it may be sent (keeps your hold length)
-    int fireTick = -1;       // -1 = not planned yet
-    int firstDeath = -1;     // where the on-time input would have died
-    bool foundSafe = true;
-    bool skipped = false;    // not checked (gamemode not assisted)
-    bool spam = false;       // part of fast wave spam
-    bool autoRelease = false; // made by Release Assist, not by you
-    bool orb = false;        // a click on/near an orb
-    int safeCount = 0;       // how many safe ticks were found (random pick / safe run)
-    bool edgeRun = false;    // chosen from the middle of a run of safe ticks
-    bool checked = false;    // the tracer actually verified the chosen tick
-};
-
-struct AssistState {
-    int tick = 0;
-
-    // Tracer
-    PlayerObject* fake = nullptr;        // tracer currently being flown
-    PlayerObject* fake1 = nullptr;       // tracer for player 1
-    PlayerObject* fake2 = nullptr;       // tracer for player 2 (dual)
-    PlayLayer* owner = nullptr;
-    bool tracing = false;
-    bool traceDied = false;
-    bool traceDone = false;
-    float playerDt = 0.f;
-    float collideDt = 0.f;
-    // How far you really move forward per tick (measured every tick).
-    float realDx = 0.f;
-    float traceDx = 0.f;                 // tracer's forward speed (changes at speed portals)
-    int orbCutoff = -1;                  // after this trace tick, orbs need a new click
-    int lastLook = 0;                    // safety check length used for the last input
-    bool traceUsedOrb = false;           // the tracer's click fired an orb
-    bool nearInteractable = false;       // an orb/pad/portal was near the tracer last step
-    bool nearSlope = false;              // a slope was near the tracer last step
-
-    // Tracer collisions run in GD's "ignore damage" mode, so GD never calls
-    // its death function for the tracer: noclip death counters and other mods
-    // never see tracer deaths. The mod's own hitbox checks detect them instead.
-    // If your GD skips object collisions entirely in that mode, the mod notices
-    // and switches back.
-    bool ignoreDamage = true;
-    int ignoreDamageEmpty = 0;           // setup passes in a row that saw no objects
-    bool ignoreDamageDecided = false;
-
-    // Performance
-    bool debugOn = false;                // debug panel setting, cached once per tick
-    unsigned int budgetFrame = 0;        // which drawn frame the budget below is for
-    double budgetUsedMs = 0.0;           // checking time already spent this frame
-    float prevTickX = 0.f;
-    float prevTickY = 0.f;
-    // Wave slope (vertical speed / horizontal speed), measured from your real
-    // wave. GD's documented values are 1 (45 deg) and 2 for mini (~63.43 deg);
-    // these start there and are refined from your actual movement.
-    // Measured separately for every case, so any difference between going up
-    // and going down is picked up: [mini][holding][upside down].
-    float waveSlope[2][2][2] = {{{1.f, 1.f}, {1.f, 1.f}}, {{2.f, 2.f}, {2.f, 2.f}}};
-    int waveSlopeN[2][2][2] = {};
-    int prevTickNum = -1000;
-    // Offset between your drawn position and your physics position.
-    CCPoint nodeOffset = CCPointZero;
-    bool builtinActive = false;          // current trace uses built-in wave physics
-    std::vector<GameObject*> lastKept;   // objects near the tracer this step
-    // Noclip: spikes/blocks you're already inside when a prediction starts.
-    // They don't count as deaths for that prediction; only new contacts do.
-    std::unordered_set<GameObject*> startOverlap;
-
-    // Inputs
-    std::deque<PendingInput> queue;
-    bool heldInGame = false;   // what the game currently thinks the button is
-    int lastRealInputTick = -100000;   // last real press (for spam detection)
-    bool pressWasSpam = false;
-    int pressShift = 0;        // how late the last press was sent (applied to its release)
-    bool injecting = false;
-    double planMs = 0.0;
-
-    // Release Assist
-    bool physHeld = false;       // you are physically holding the button
-    int holdStartTick = 0;       // tick the current press reached the game
-    bool autoReleased = false;   // Release Assist let go for you; your own release is skipped
-    int nextAutoCheck = 0;       // earliest tick to look for a release again
-
-    // Objects the tracer used (orbs, pads, portals): their activation is put back after each trace
-    struct Touched { GameObject* obj; bool activated; };
-    std::vector<Touched> touched;
-    int diagOrbs = 0;                    // interactables the tracer touched
-    int diagFallbackDeaths = 0;          // deaths found by our own hitbox check
-
-    // Moving objects: positions of objects near you are tracked every real
-    // tick, so the tracer can move them ahead in time while it predicts.
-    struct Track {
-        CCPoint lastPos;
-        CCPoint vel;                 // units per tick
-        CCPoint acc;                 // change of vel per tick (easing, speeding up, slowing down)
-        float lastRot = 0.f;
-        float rotVel = 0.f;          // degrees per tick
-        int lastTick = -1000;
-        int samples = 0;
-    };
-    std::unordered_map<GameObject*, Track> tracks;
-    struct Saved { CCPoint pos; float rot; };
-    std::unordered_map<GameObject*, Saved> movedForTrace;     // original positions/rotations
-    bool scouting = false;               // looking ahead for objects, not predicting
-    int traceAhead = 0;                  // ticks into the future the tracer is at
-    int diagMovers = 0;
-
-    // Diagnostics (last trace)
-    int diagTicks = 0;
-    int diagCollChecks = 0;
-    int diagMaxObjs = 0;
-    float diagMovedX = 0.f;
-    float diagMovedY = 0.f;
-    float diagStartDiff = 0.f;
-    bool diagTimedOut = false;
-    std::string diagReason;
-
-    // Debug panel
-    CCLabelBMFont* debugLabel = nullptr;
-    std::deque<std::string> lines;
-
-    void reset() {
-        tick = 0;
-        tracing = false;
-        traceDied = false;
-        traceDone = false;
-        queue.clear();
-        heldInGame = false;
-        physHeld = false;
-        holdStartTick = 0;
-        autoReleased = false;
-        nextAutoCheck = 0;
-        lastRealInputTick = -100000;
-        pressWasSpam = false;
-        pressShift = 0;
-        injecting = false;
-        lines.clear();
-        prevTickNum = -1000;
-        tracks.clear();
-        movedForTrace.clear();
+{
+  "geode": "5.11.1",
+  "gd": {
+    "win": "2.2081",
+    "android": "2.2081",
+    "mac": "2.2081"
+  },
+  "id": "yourname.click-assist",
+  "name": "Click Assist",
+  "version": "v0.1.0",
+  "developer": "MrCTeo",
+  "description": "Practice aid: an invisible tracer checks every press and release, and sends it on the first safe tick within the next few ticks. Shows a label and puts the attempt in test mode, so progress and completions are not saved.",
+  "settings": {
+    "enabled": {
+      "type": "bool",
+      "name": "Enable Click Assist",
+      "description": "Turns the assist on. While on, the attempt runs in test mode and nothing is saved.",
+      "default": false
+    },
+    "window": {
+      "type": "int",
+      "name": "Press search window (ticks)",
+      "description": "How many ticks a press may be moved later to avoid a death (up to 32). GD runs at 240 ticks per second, so 4 ticks is about 17 ms and 32 ticks about 133 ms.",
+      "default": 4,
+      "min": 1,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "release-window": {
+      "type": "int",
+      "name": "Release search window (ticks)",
+      "description": "How many ticks a release may be moved later to avoid a death (up to 32), meaning you keep holding a bit longer. Releases can only be moved later, never earlier.",
+      "default": 4,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "orb-window": {
+      "type": "int",
+      "name": "Orb search window (ticks)",
+      "description": "Like the press search window, but for clicks on or near an orb: how many ticks such a click may be held back to find a tick where it doesn't kill you.",
+      "default": 8,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "orb-catch": {
+      "type": "int",
+      "name": "Orb catch time (ticks)",
+      "description": "How many ticks after a click it can still fire an orb in the prediction. Raise it if the mod misses orbs you click just before touching them; lower it if it fires orbs too late.",
+      "default": 2,
+      "min": 0,
+      "max": 10,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "random-pick": {
+      "type": "bool",
+      "name": "Random safe tick",
+      "description": "When a click has to be moved, check every tick in the window and pick one of the safe ones at random instead of always the first. Clicks that are already safe on time are never moved. Uses more time per click.",
+      "default": false
+    },
+    "edge-margin": {
+      "type": "int",
+      "name": "Edge margin (ticks)",
+      "description": "When an input has to be moved and several ticks in a row are safe, don't use the first one (it's right at the edge, where small prediction errors hurt most). Instead go into the middle of the safe run, up to this many ticks past its first safe tick. 0 = always the first safe tick.",
+      "default": 2,
+      "min": 0,
+      "max": 5,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "lookahead": {
+      "type": "int",
+      "name": "Safety check (ticks)",
+      "description": "How many ticks after a click it must survive for that tick to count as safe. Keep this short (15-30) so later obstacles that need another click do not count.",
+      "default": 20,
+      "min": 5,
+      "max": 360,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "wave-lookahead": {
+      "type": "int",
+      "name": "Wave safety check (ticks)",
+      "description": "Safety check used while you're in wave. Wave inputs come fast, so this is shorter: an input only has to stay safe until your next one usually arrives.",
+      "default": 10,
+      "min": 3,
+      "max": 360,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "release-lookahead": {
+      "type": "int",
+      "name": "Release safety check (ticks)",
+      "description": "How many ticks after you let go the mod checks for a death, in every gamemode including wave. Falling into something after letting go early usually happens later than a click's death, so this can be longer than the wave safety check. Release Assist keeps using the normal safety check.",
+      "default": 20,
+      "min": 3,
+      "max": 360,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "check-time": {
+      "type": "int",
+      "name": "Check time limit (ms)",
+      "description": "How long the mod may spend checking one input. Releases that need a long search (letting go several ticks too early) can run out of time; raising this gives them room. Higher values can cause small stutters on heavy levels.",
+      "default": 8,
+      "min": 2,
+      "max": 16,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "frame-budget": {
+      "type": "int",
+      "name": "Frame check budget (ms)",
+      "description": "Total time all checks may use within one drawn frame. In fast spam many inputs land in the same frame; this cap keeps them from adding up to frame drops. Inputs that come after the budget is used up are sent on time, unchecked.",
+      "default": 2,
+      "min": 1,
+      "max": 16,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "wave-spam": {
+      "type": "bool",
+      "name": "Wave spam fix",
+      "description": "When you spam on wave, inputs are never allowed to pile up: anything still waiting is sent immediately, and each spam input can only move a tiny bit, so your rhythm stays intact.",
+      "default": true
+    },
+    "spam-gap": {
+      "type": "int",
+      "name": "Spam gap (ticks)",
+      "description": "Wave inputs closer together than this count as spam. 15 ticks is about 60 ms.",
+      "default": 15,
+      "min": 4,
+      "max": 40,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "spam-max-delay": {
+      "type": "int",
+      "name": "Spam max delay (ticks)",
+      "description": "How far a spam input may be moved to dodge a death. 0 means spam inputs are never moved.",
+      "default": 1,
+      "min": 0,
+      "max": 4,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "release-assist": {
+      "type": "bool",
+      "name": "Release Assist",
+      "description": "If you hold longer than the limit below, the mod lets go for you on the first tick where releasing doesn't kill you, using the same safety check as your clicks. Your own release afterwards is skipped. Not used in ship, swing, robot, dual or platformer.",
+      "default": false
+    },
+    "release-assist-after": {
+      "type": "int",
+      "name": "Release Assist limit (ticks)",
+      "description": "How long you have to hold before Release Assist starts looking for a safe moment to let go. 240 ticks is 1 second.",
+      "default": 120,
+      "min": 60,
+      "max": 240,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "ship-assist": {
+      "type": "bool",
+      "name": "Ship assist",
+      "description": "Check ship clicks and releases like the other gamemodes, so they can be held back to a safe tick. When off, only orb clicks in ship are assisted. Release Assist never lets go for you in ship either way.",
+      "default": false
+    },
+    "dual-assist": {
+      "type": "bool",
+      "name": "Dual assist",
+      "description": "Assist in dual mode. Each player gets its own invisible tracer, and an input is only moved to a tick where BOTH players survive. Turn off if dual ever misbehaves: inputs then go straight through in dual like before. Two-player mode (split controls) is never assisted. Release Assist doesn't act in dual.",
+      "default": true
+    },
+    "predict-moving": {
+      "type": "bool",
+      "name": "Predict moving objects",
+      "description": "Tracks how objects near you are moving, so the tracer checks against where they will be instead of where they are right now.",
+      "default": true
+    },
+    "force-delay": {
+      "type": "int",
+      "name": "TEST: force press delay (ticks)",
+      "description": "For testing only. Delays EVERY press by this many ticks without any prediction, to check that holding back clicks works at all. 0 = off (normal assist).",
+      "default": 0,
+      "min": 0,
+      "max": 32,
+      "control": {
+        "slider": true,
+        "arrows": true,
+        "input": true
+      }
+    },
+    "debug": {
+      "type": "bool",
+      "name": "Debug panel",
+      "description": "Shows what the assist decides on every click in the top-left corner: whether the click was safe, which tick it was sent on, and how long the check took.",
+      "default": false
     }
-};
-
-static AssistState s;
-
-// ---------- debug panel ----------
-
-static void debugLine(std::string const& line) {
-    // Panel text and log lines are only produced with the debug panel on:
-    // rebuilding the text and writing the log on every spam input was a big
-    // part of the frame drops.
-    if (!s.debugOn) return;
-    if (line.rfind("   ", 0) != 0) log::info("[CA] {}", line);
-    s.lines.push_back(line);
-    while (s.lines.size() > 8) s.lines.pop_front();
-    if (!s.debugLabel) return;
-    std::string text;
-    for (auto& l : s.lines) { text += l; text += "\n"; }
-    s.debugLabel->setString(text.c_str());
+  }
 }
-
-static void debugDiag() {
-    if (!s.debugOn) return;
-    if (!s.diagReason.empty()) {
-        debugLine("   SKIPPED: " + s.diagReason);
-        log::info("[CA]    SKIPPED: {}", s.diagReason);
-        return;
-    }
-    log::info("[CA]    ticks {} moved {:.1f},{:.1f} start-off {:.1f} coll {} objs {} orbs {} movers {} backup {} timeout {} dt {:.5f}/{:.5f}",
-              s.diagTicks, s.diagMovedX, s.diagMovedY, s.diagStartDiff,
-              s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers, s.diagFallbackDeaths,
-              s.diagTimedOut, s.playerDt, s.collideDt);
-    debugLine(fmt::format("   check {} ticks {} moved {:.3f},{:.3f} dt {:.5f}/{:.5f} speed {:.3f} coll {} objs {} orbs {} movers {}{}{}",
-                          s.lastLook, s.diagTicks, s.diagMovedX, s.diagMovedY, s.playerDt, s.collideDt, s.realDx,
-                          s.diagCollChecks, s.diagMaxObjs, s.diagOrbs, s.diagMovers,
-                          s.diagFallbackDeaths ? " BACKUP-DEATH" : "",
-                          s.diagTimedOut ? " TIMEOUT" : ""));
-}
-
-// ---------- object types ----------
-
-// Things that kill or block you.
-static bool isSolidOrHazard(GameObjectType t) {
-    switch (t) {
-        case GameObjectType::Solid:
-        case GameObjectType::Hazard:
-        case GameObjectType::AnimatedHazard:
-        case GameObjectType::Slope:
-            return true;
-        default:
-            return false;
-    }
-}
-
-// Things that only change the player who touches them. The tracer is allowed to
-// use these; their activation is restored after every trace.
-static bool isPlayerOnlyInteractable(GameObjectType t) {
-    switch (t) {
-        case GameObjectType::YellowJumpPad:
-        case GameObjectType::PinkJumpPad:
-        case GameObjectType::GravityPad:
-        case GameObjectType::RedJumpPad:
-        case GameObjectType::SpiderPad:
-        case GameObjectType::YellowJumpRing:
-        case GameObjectType::PinkJumpRing:
-        case GameObjectType::GravityRing:
-        case GameObjectType::RedJumpRing:
-        case GameObjectType::GreenRing:
-        case GameObjectType::DashRing:
-        case GameObjectType::GravityDashRing:
-        case GameObjectType::DropRing:
-        case GameObjectType::CustomRing:
-        case GameObjectType::InverseGravityPortal:
-        case GameObjectType::NormalGravityPortal:
-        case GameObjectType::GravityTogglePortal:
-        case GameObjectType::MiniSizePortal:
-        case GameObjectType::RegularSizePortal:
-            return true;
-        default:
-            return false;
-    }
-}
-
-// Orbs: they only fire on a click.
-static bool isOrb(GameObjectType t) {
-    switch (t) {
-        case GameObjectType::YellowJumpRing:
-        case GameObjectType::PinkJumpRing:
-        case GameObjectType::GravityRing:
-        case GameObjectType::RedJumpRing:
-        case GameObjectType::GreenRing:
-        case GameObjectType::DashRing:
-        case GameObjectType::GravityDashRing:
-        case GameObjectType::DropRing:
-        case GameObjectType::CustomRing:
-            return true;
-        default:
-            return false;
-    }
-}
-
-// Things that change the whole level (camera, ground, both players).
-// The tracer can't safely go through these, so a trace stops when it reaches one.
-static bool isLevelChangingPortal(GameObjectType t) {
-    switch (t) {
-        case GameObjectType::ShipPortal:
-        case GameObjectType::CubePortal:
-        case GameObjectType::BallPortal:
-        case GameObjectType::UfoPortal:
-        case GameObjectType::WavePortal:
-        case GameObjectType::RobotPortal:
-        case GameObjectType::SpiderPortal:
-        case GameObjectType::SwingPortal:
-        case GameObjectType::DualPortal:
-        case GameObjectType::SoloPortal:
-        case GameObjectType::TeleportPortal:
-        case GameObjectType::SpiderOrb:
-        case GameObjectType::TeleportOrb:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static void rememberTouched(GameObject* obj) {
-    for (auto& t : s.touched) if (t.obj == obj) return;
-    s.touched.push_back({obj, obj->m_isActivated});
-}
-
-static void restoreTouched() {
-    for (auto& t : s.touched) {
-        t.obj->m_isActivated = t.activated;
-    }
-    s.diagOrbs = static_cast<int>(s.touched.size());
-    s.touched.clear();
-}
-
-// Removes anything the tracer spawned into the level (orb rings, pad effects).
-static void removeNewChildren(CCNode* node, unsigned int oldCount) {
-    if (!node) return;
-    auto children = node->getChildren();
-    if (!children) return;
-    while (children->count() > oldCount) {
-        auto child = static_cast<CCNode*>(children->lastObject());
-        child->removeFromParentAndCleanup(true);
-    }
-}
-
-// ---------- moving objects ----------
-
-// Records where objects are right now and works out how they move:
-// speed, acceleration (for eased moves) and rotation speed.
-static void trackObjects(gd::vector<GameObject*>* objects, int n) {
-    for (int i = 0; i < n; ++i) {
-        auto obj = (*objects)[i];
-        if (!obj) continue;
-        auto& tr = s.tracks[obj];
-        if (tr.lastTick == s.tick) continue;          // already seen this tick
-        CCPoint pos = obj->getPosition();
-        float rot = obj->getRotation();
-        int gap = s.tick - tr.lastTick;
-        if (gap >= 1 && gap <= 8 && tr.samples > 0) {
-            float g = static_cast<float>(gap);
-            CCPoint v = (pos - tr.lastPos) / g;
-            float rv = (rot - tr.lastRot) / g;
-            if (tr.samples >= 2) {
-                CCPoint a = (v - tr.vel) / g;
-                tr.acc = tr.acc * 0.5f + a * 0.5f;
-            }
-            // Light smoothing so one odd frame doesn't throw the prediction off.
-            tr.vel = tr.vel * 0.25f + v * 0.75f;
-            tr.rotVel = tr.rotVel * 0.25f + rv * 0.75f;
-            tr.samples++;
-        } else {
-            tr.vel = CCPointZero;
-            tr.acc = CCPointZero;
-            tr.rotVel = 0.f;
-            tr.samples = 1;
-        }
-        tr.lastPos = pos;
-        tr.lastRot = rot;
-        tr.lastTick = s.tick;
-    }
-    // Forget objects that haven't been near you for a while.
-    if ((s.tick & 255) == 0) {
-        for (auto it = s.tracks.begin(); it != s.tracks.end();) {
-            if (s.tick - it->second.lastTick > 240) it = s.tracks.erase(it);
-            else ++it;
-        }
-    }
-}
-
-// Puts an object where it will be `ahead` ticks from now (tracer only):
-// position from speed + acceleration, angle from rotation speed.
-static void moveAhead(GameObject* obj, int ahead) {
-    auto it = s.tracks.find(obj);
-    if (it == s.tracks.end()) return;
-    auto& tr = it->second;
-    if (tr.samples < 2 || s.tick - tr.lastTick > 6) return;    // no fresh data
-    bool moving = std::abs(tr.vel.x) > 0.001f || std::abs(tr.vel.y) > 0.001f
-               || std::abs(tr.acc.x) > 0.0005f || std::abs(tr.acc.y) > 0.0005f;
-    bool rotating = std::abs(tr.rotVel) > 0.01f;
-    if (!moving && !rotating) return;
-
-    auto saved = s.movedForTrace.find(obj);
-    if (saved == s.movedForTrace.end()) {
-        // Remember the real position/angle once, to put it back after the trace.
-        s.movedForTrace[obj] = AssistState::Saved{obj->getPosition(), obj->getRotation()};
-    }
-
-    // Data is from tr.lastTick; predict from there to `ahead` ticks after now.
-    float t = static_cast<float>(ahead + (s.tick - tr.lastTick));
-    CCPoint base = tr.lastPos;
-    CCPoint byVel = tr.vel * t;
-    CCPoint byAcc = tr.acc * (0.5f * t * t);
-    // Acceleration is only trusted up to the size of the move itself, so a noisy
-    // reading can't fling an object across the screen.
-    float velLen = ccpLength(byVel) + 2.f;
-    float accLen = ccpLength(byAcc);
-    if (accLen > velLen) byAcc = byAcc * (velLen / accLen);
-
-    if (moving) obj->setPosition(base + byVel + byAcc);
-    if (rotating) obj->setRotation(tr.lastRot + tr.rotVel * t);
-}
-
-// Puts every object the tracer moved back exactly where it really is.
-static void restoreMoved() {
-    s.diagMovers = static_cast<int>(s.movedForTrace.size());
-    for (auto& [obj, sv] : s.movedForTrace) {
-        obj->setPosition(sv.pos);
-        obj->setRotation(sv.rot);
-    }
-    s.movedForTrace.clear();
-}
-
-// ---------- tracer ----------
-
-static void injectButton(GJBaseGameLayer* layer, bool down) {
-    s.injecting = true;
-    layer->handleButton(down, 1, true);
-    s.injecting = false;
-}
-
-static bool ensureTracer(PlayLayer* pl) {
-    if (s.fake && s.owner == pl) return true;
-
-    // Hidden layer: the tracer and anything it spawns are never drawn.
-    auto hidden = CCLayer::create();
-    hidden->setVisible(false);
-    pl->addChild(hidden, -1000);
-
-    // The last argument tells GD this player belongs to a real level. Players
-    // created with `false` (like the ones in the main menu) don't run their own
-    // physics, which is why the tracer never moved.
-    auto fake = PlayerObject::create(1, 1, pl, hidden, true);
-    auto fake2 = PlayerObject::create(1, 1, pl, hidden, true);
-    if (!fake || !fake2) return false;
-    // Not hidden themselves: GD may skip updating a hidden player. Their parent
-    // layer is hidden, so they're still never drawn.
-    hidden->addChild(fake);
-    hidden->addChild(fake2);
-
-    s.fake = fake;
-    s.fake1 = fake;
-    s.fake2 = fake2;
-    s.owner = pl;
-    return true;
-}
-
-// Copies a field only if it exists in your GD version's bindings, so a guessed
-// field name can never break the build.
-#define CA_COPY_IF_EXISTS(dst, src, field) \
-    [](auto* d, auto* s2) { if constexpr (requires { d->field = s2->field; }) d->field = s2->field; }(dst, src)
-#define CA_HAS_FIELD(type, field) \
-    ([](auto* d) { return requires { d->field; }; }(static_cast<type*>(nullptr)))
-
-// True if the tracer can copy your exact button/orb-buffer state, instead of
-// pretending you just pressed.
-static constexpr bool kCopiesHoldState = CA_HAS_FIELD(PlayerObject, m_holdingButtons);
-
-static void copyPlayerState(PlayerObject* dst, PlayerObject* src) {
-    dst->copyAttributes(src);
-
-    // Button and orb state: whether you're holding, whether a click is buffered,
-    // which orbs/pads you're touching or already used. This is what decides if
-    // an orb fires, so the tracer has to match you exactly.
-    CA_COPY_IF_EXISTS(dst, src, m_holdingButtons);
-    CA_COPY_IF_EXISTS(dst, src, m_jumpBuffered);
-    CA_COPY_IF_EXISTS(dst, src, m_stateJumpBuffered);
-    CA_COPY_IF_EXISTS(dst, src, m_wasJumpBuffered);
-    CA_COPY_IF_EXISTS(dst, src, m_hasJustHeld);
-    CA_COPY_IF_EXISTS(dst, src, m_hasJustHeld2);
-    CA_COPY_IF_EXISTS(dst, src, m_isHolding);
-    CA_COPY_IF_EXISTS(dst, src, m_isHolding2);
-    CA_COPY_IF_EXISTS(dst, src, m_stateRingJump);
-    CA_COPY_IF_EXISTS(dst, src, m_stateRingJump2);
-    CA_COPY_IF_EXISTS(dst, src, m_touchedRings);
-    CA_COPY_IF_EXISTS(dst, src, m_ringRelatedSet);
-    CA_COPY_IF_EXISTS(dst, src, m_touchedPad);
-
-    // Movement state used by jumps, slopes, dashes and gravity.
-    CA_COPY_IF_EXISTS(dst, src, m_isDashing);
-    CA_COPY_IF_EXISTS(dst, src, m_dashX);
-    CA_COPY_IF_EXISTS(dst, src, m_dashY);
-    CA_COPY_IF_EXISTS(dst, src, m_dashAngle);
-    CA_COPY_IF_EXISTS(dst, src, m_isSliding);
-    CA_COPY_IF_EXISTS(dst, src, m_isRising);
-    CA_COPY_IF_EXISTS(dst, src, m_isOnSlope);
-    CA_COPY_IF_EXISTS(dst, src, m_wasOnSlope);
-    CA_COPY_IF_EXISTS(dst, src, m_gravityMod);
-    CA_COPY_IF_EXISTS(dst, src, m_gravity);
-    CA_COPY_IF_EXISTS(dst, src, m_isLocked);
-    CA_COPY_IF_EXISTS(dst, src, m_lastGroundedPos);
-    CA_COPY_IF_EXISTS(dst, src, m_isSideways);
-    CA_COPY_IF_EXISTS(dst, src, m_isGoingLeft);
-
-    dst->m_isShip = src->m_isShip;
-    dst->m_isBird = src->m_isBird;
-    dst->m_isBall = src->m_isBall;
-    dst->m_isDart = src->m_isDart;
-    dst->m_isRobot = src->m_isRobot;
-    dst->m_isSpider = src->m_isSpider;
-    dst->m_isSwing = src->m_isSwing;
-    dst->m_isUpsideDown = src->m_isUpsideDown;
-    dst->m_vehicleSize = src->m_vehicleSize;
-    dst->m_playerSpeed = src->m_playerSpeed;
-    dst->m_isOnGround = src->m_isOnGround;
-    dst->m_yVelocity = src->m_yVelocity;
-    dst->m_position = src->m_position;
-    // Where the player was last tick. GD checks collisions along the path from
-    // here to the current position; a fresh tracer had (0,0) here, so its first
-    // collision check swept across half the level and "died" instantly.
-    dst->m_lastPosition = src->m_lastPosition;
-    dst->setPosition(src->getPosition());
-}
-
-// ---------- wave slope measurement ----------
-
-// Learns the exact wave slope from your real wave, tick by tick. Ticks where
-// you slide along a floor, turn around mid-tick, or pass a portal don't match
-// the expected slope closely and are ignored.
-static void measureWaveSlope(PlayerObject* player, float dx, float dy) {
-    int mini = player->m_vehicleSize < 0.9f ? 1 : 0;
-    int held = s.heldInGame ? 1 : 0;
-    int flip = player->m_isUpsideDown ? 1 : 0;
-    float expected = mini ? 2.f : 1.f;
-    float ratio = std::abs(dy) / dx;
-    if (std::abs(ratio - expected) > 0.15f * expected) return;
-
-    float& slope = s.waveSlope[mini][held][flip];
-    int& n = s.waveSlopeN[mini][held][flip];
-    float weight = 1.f / static_cast<float>(std::min(n + 1, 100));
-    slope += (ratio - slope) * weight;
-    n += 1;
-    if (n == 30) {
-        bool goingUp = (held != 0) != (flip != 0);
-        debugLine(fmt::format("wave slope measured ({} {}): {:.4f} = {:.2f} deg",
-                              mini ? "mini" : "normal", goingUp ? "up" : "down", slope,
-                              std::atan(slope) * 180.f / 3.14159265f));
-    }
-}
-
-// ---------- tracer movement helpers ----------
-
-// Moves the tracer: physics position and drawn position together, keeping the
-// same offset between them that your real player has.
-static void setTracerPos(CCPoint p) {
-    s.fake->m_position = p;
-    s.fake->setPosition(p + s.nodeOffset);
-}
-
-// The tracer's hitbox: your real hitbox, moved to where the tracer is. That way
-// it's always exactly your size (mini, wave hitbox) whatever the tracer copied.
-static PlayerObject* s_realPlayer = nullptr;
-static CCRect tracerRect() {
-    auto r = s_realPlayer->getObjectRect();
-    CCPoint off = s.fake->m_position - s_realPlayer->m_position;
-    r.origin = r.origin + off;
-    // Size portals: if the tracer became mini or normal size during the
-    // prediction, scale the hitbox the same way around its center.
-    float realSize = s_realPlayer->m_vehicleSize;
-    float fakeSize = s.fake->m_vehicleSize;
-    if (realSize > 0.f && std::abs(fakeSize - realSize) > 0.01f) {
-        float k = fakeSize / realSize;
-        float w = r.size.width * k, h = r.size.height * k;
-        r = CCRect(r.getMidX() - w / 2.f, r.getMidY() - h / 2.f, w, h);
-    }
-    return r;
-}
-
-// ---------- speed portals ----------
-// GD speeds, as the player's speed value and how far that speed moves per second.
-struct SpeedInfo { int id; float playerSpeed; float unitsPerSec; };
-static constexpr SpeedInfo kSpeeds[] = {
-    {200, 0.7f, 251.16f},   // 0.5x
-    {201, 0.9f, 311.58f},   // 1x
-    {202, 1.1f, 387.42f},   // 2x
-    {203, 1.3f, 468.00f},   // 3x
-    {1334, 1.6f, 576.00f},  // 4x
-};
-
-static SpeedInfo const* speedForPortal(int objectID) {
-    for (auto& sp : kSpeeds) if (sp.id == objectID) return &sp;
-    return nullptr;
-}
-
-static SpeedInfo const* speedForPlayer(float playerSpeed) {
-    SpeedInfo const* best = &kSpeeds[1];
-    for (auto& sp : kSpeeds) {
-        if (std::abs(sp.playerSpeed - playerSpeed) < std::abs(best->playerSpeed - playerSpeed)) best = &sp;
-    }
-    return best;
-}
-
-// The tracer touched a speed portal: from now on it moves at that speed, scaled
-// from your measured speed so it stays exact.
-static void tracerHitSpeedPortal(SpeedInfo const* sp) {
-    auto cur = speedForPlayer(s.fake->m_playerSpeed);
-    if (cur == sp) return;
-    s.traceDx = s.traceDx * (sp->unitsPerSec / cur->unitsPerSec);
-    s.fake->m_playerSpeed = sp->playerSpeed;
-}
-
-// A smaller box in the middle of a hitbox (GD's "inner hitbox" for blocks).
-static CCRect innerRect(CCRect const& r, float scale) {
-    float w = r.size.width * scale, h = r.size.height * scale;
-    return CCRect(r.getMidX() - w / 2.f, r.getMidY() - h / 2.f, w, h);
-}
-
-// After GD has run its code on the tracer, its new height can be in either the
-// physics position or the drawn position, depending on what GD changed. This
-// takes whichever one moved away from `y`, and keeps both in sync.
-static float pickNewY(float y) {
-    float my = s.fake->m_position.y;
-    float ny = s.fake->getPositionY() - s.nodeOffset.y;
-    if (std::abs(my - y) > 1e-4f) return my;
-    if (std::abs(ny - y) > 1e-4f) return ny;
-    return y;
-}
-
-static bool startedInside(GameObject* obj) {
-    return obj && s.startOverlap.count(obj) != 0;
-}
-
-// ---------- built-in wave physics ----------
-//
-// Wave is simple enough to simulate exactly: it moves forward at your speed and
-// goes diagonally up while held, down while released (twice as steep in mini).
-// Floors and ceilings are slid along; hitting a block side or a spike kills.
-
-static void waveStep(bool held) {
-    CCPoint p = s.fake->m_position;
-    // GD checks collisions along the path from last tick's position, so that
-    // has to be where the tracer really was one tick ago.
-    s.fake->m_lastPosition = p;
-    float slope = s.waveSlope[s.fake->m_vehicleSize < 0.9f ? 1 : 0][held ? 1 : 0]
-                             [s.fake->m_isUpsideDown ? 1 : 0];
-    float dir = (held ? 1.f : -1.f) * (s.fake->m_isUpsideDown ? -1.f : 1.f);
-    p.x += s.traceDx;
-    p.y += dir * slope * s.traceDx;
-    setTracerPos(p);
-}
-
-// Returns true if the tracer dies against the objects near it.
-// ---------- slopes ----------
-// A slope's solid part is a right triangle inside its box. Unrotated and
-// unflipped, it fills the bottom-right half (a ramp rising to the right).
-// Flips and 90-degree rotations move that triangle around the box.
-struct Tri { CCPoint p[3]; };
-
-static Tri slopeTriangle(GameObject* obj) {
-    auto r = obj->getObjectRect();
-    float rot = std::fmod(std::fmod(obj->getRotation(), 360.f) + 360.f, 360.f);
-    int quarter = static_cast<int>(std::lround(rot / 90.f)) % 4;
-    float w = r.size.width, h = r.size.height;
-    if (quarter % 2 == 1) std::swap(w, h);   // the box was measured after rotating
-    bool fx = obj->isFlipX() || obj->getScaleX() < 0.f;
-    bool fy = obj->isFlipY() || obj->getScaleY() < 0.f;
-    CCPoint local[3] = {CCPoint(-w / 2.f, -h / 2.f), CCPoint(w / 2.f, -h / 2.f), CCPoint(w / 2.f, h / 2.f)};
-    CCPoint center(r.getMidX(), r.getMidY());
-    Tri t;
-    for (int i = 0; i < 3; ++i) {
-        float x = local[i].x * (fx ? -1.f : 1.f);
-        float y = local[i].y * (fy ? -1.f : 1.f);
-        for (int q = 0; q < quarter; ++q) {   // GD rotation is clockwise
-            float nx = y, ny = -x;
-            x = nx; y = ny;
-        }
-        t.p[i] = CCPoint(center.x + x, center.y + y);
-    }
-    return t;
-}
-
-// True if the triangle and the box overlap (separating axis test).
-static bool triOverlapsRect(Tri const& t, CCRect const& r) {
-    CCPoint rp[4] = {CCPoint(r.getMinX(), r.getMinY()), CCPoint(r.getMaxX(), r.getMinY()),
-                     CCPoint(r.getMaxX(), r.getMaxY()), CCPoint(r.getMinX(), r.getMaxY())};
-    auto separated = [&](CCPoint axis) {
-        float a0 = 1e30f, a1 = -1e30f, b0 = 1e30f, b1 = -1e30f;
-        for (auto& p : t.p) { float d = p.x * axis.x + p.y * axis.y; a0 = std::min(a0, d); a1 = std::max(a1, d); }
-        for (auto& p : rp)  { float d = p.x * axis.x + p.y * axis.y; b0 = std::min(b0, d); b1 = std::max(b1, d); }
-        return a1 < b0 || b1 < a0;
-    };
-    if (separated(CCPoint(1.f, 0.f)) || separated(CCPoint(0.f, 1.f))) return false;
-    for (int i = 0; i < 3; ++i) {
-        CCPoint e = t.p[(i + 1) % 3] - t.p[i];
-        if (separated(CCPoint(-e.y, e.x))) return false;
-    }
-    return true;
-}
-
-static bool waveCollide(CCRect const& before) {
-    for (auto obj : s.lastKept) {
-        if (startedInside(obj)) continue;
-        auto type = obj->m_objectType;
-        auto r = obj->getObjectRect();
-        auto outer = tracerRect();
-        if (!outer.intersectsRect(r)) continue;
-
-        if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) {
-            return true;
-        }
-        if (type == GameObjectType::Slope) {
-            // Sliding along a slope only touches it with the edge of the hitbox;
-            // flying into its face pushes the inner hitbox into the triangle.
-            if (triOverlapsRect(slopeTriangle(obj), innerRect(outer, 0.3f))) return true;
-            continue;
-        }
-        if (type == GameObjectType::Solid) {
-            float top = r.getMaxY(), bottom = r.getMinY();
-            if (before.getMinY() >= top - 0.5f) {
-                // Came from above: slide along the top.
-                CCPoint p = s.fake->m_position;
-                p.y += top - outer.getMinY();
-                setTracerPos(p);
-                continue;
-            }
-            if (before.getMaxY() <= bottom + 0.5f) {
-                // Came from below: slide along the bottom.
-                CCPoint p = s.fake->m_position;
-                p.y -= outer.getMaxY() - bottom;
-                setTracerPos(p);
-                continue;
-            }
-            return true;   // hit the side of a block
-        }
-    }
-    return false;
-}
-
-
-// Flies the tracer: keeps the current button state for `delay` ticks, then
-// applies the input (`down`), then keeps that state until `maxTicks`.
-// Returns the tick it died on, or -1 if it survived.
-// `real` is the player being predicted (player 1, or player 2 in dual).
-static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
-                      std::chrono::steady_clock::time_point deadline,
-                      PlayerObject* real) {
-    // A press is checked as exactly that one click: it can fire the orb you
-    // click on (GD gives a click a couple of ticks to catch an orb), but orbs
-    // reached later need a new click, so the tracer doesn't take them.
-    s.orbCutoff = down ? delay + orbCatch() : -1;
-    s.traceUsedOrb = false;
-    s.nearInteractable = false;
-    s.nearSlope = false;
-    s.diagTicks = 0;
-    s.diagCollChecks = 0;
-    s.diagMaxObjs = 0;
-    s.diagMovedX = 0.f;
-    s.diagMovedY = 0.f;
-    s.diagStartDiff = 0.f;
-    s.diagTimedOut = false;
-    s.diagOrbs = 0;
-    s.diagFallbackDeaths = 0;
-    s.diagMovers = 0;
-    s.diagReason.clear();
-    s.touched.clear();
-
-    if (s.playerDt <= 0.f)  { s.diagReason = "no update dt"; return -1; }
-    if (s.collideDt <= 0.f) { s.diagReason = "no collision dt"; return -1; }
-    if (!ensureTracer(pl))  { s.diagReason = "no tracer"; return -1; }
-    if (s.realDx < 0.01f)   { s.diagReason = "measuring your speed"; return -1; }
-    s.traceDx = s.realDx;
-
-    // Wave: built-in wave physics, exact and independent of GD's player code.
-    // Other modes: GD's own physics for height (jumps, gravity, orbs, pads) at
-    // the game's real timestep, and your measured speed for forward movement.
-    bool builtinWave = real->m_isDart;
-    s.builtinActive = builtinWave;
-    s_realPlayer = real;
-    s.nodeOffset = real->getPosition() - real->m_position;
-    float stepDt = s.playerDt;
-    float collDt = s.collideDt;
-
-    copyPlayerState(s.fake, real);
-    auto startPos = s.fake->m_position;
-    s.diagStartDiff = ccpDistance(startPos, real->m_position);
-
-    unsigned int objLayerCount = pl->m_objectLayer ? pl->m_objectLayer->getChildrenCount() : 0;
-    unsigned int plCount = pl->getChildrenCount();
-
-    s.tracing = true;
-    s.traceDied = false;
-    s.traceDone = false;
-
-    // Put the tracer in the same button state the game is in right now.
-    // If your exact hold/buffer state was copied, it already matches. Otherwise
-    // it's recreated with a press/release (less exact for orbs).
-    bool held = s.heldInGame;
-    if (!kCopiesHoldState) {
-        if (held) s.fake->pushButton(PlayerButton::Jump);
-        else      s.fake->releaseButton(PlayerButton::Jump);
-    }
-
-    // Orb fix: in the real game, a click uses whatever orb you touched on the
-    // previous tick. A freshly copied tracer hasn't touched anything yet, so
-    // clicking inside an orb did a normal jump instead of the orb. One collision
-    // pass at your current position first lets the tracer "touch" the orb you're
-    // in, exactly like you already have.
-    s.traceAhead = 0;
-    s.lastKept.clear();
-    s.startOverlap.clear();
-    pl->checkCollisions(s.fake, collDt, s.ignoreDamage);
-    if (!s.ignoreDamageDecided) {
-        if (s.diagCollChecks > 0) {
-            s.ignoreDamageDecided = true;   // object checks run in this mode: keep it
-        } else if (++s.ignoreDamageEmpty >= 5) {
-            s.ignoreDamage = false;         // they don't: fall back to the normal mode
-            s.ignoreDamageDecided = true;
-            log::info("[CA] ignore-damage collisions see no objects, using normal collisions");
-            s.lastKept.clear();
-            pl->checkCollisions(s.fake, collDt, false);
-        }
-    }
-    int death = -1;
-    // A death in this setup pass isn't a real prediction (you're alive right
-    // now), so it's ignored. Only deaths after the tracer actually moves count.
-    s.traceDied = false;
-
-    // Noclip: remember everything you're already inside right now (spikes you
-    // overlap, blocks your inner hitbox is in). Without noclip this list is
-    // always empty, because you'd already be dead.
-    {
-        auto outer = tracerRect();
-        auto inner = innerRect(outer, 0.3f);
-        for (auto obj : s.lastKept) {
-            auto type = obj->m_objectType;
-            auto r = obj->getObjectRect();
-            if ((type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard)
-                && outer.intersectsRect(r)) s.startOverlap.insert(obj);
-            else if (type == GameObjectType::Solid && inner.intersectsRect(r))
-                s.startOverlap.insert(obj);
-        }
-    }
-
-    bool movingOn = predictMoving();
-    for (int t = 0; t < maxTicks && death < 0; ++t) {
-        if (t == delay && held != down) {
-            if (down) s.fake->pushButton(PlayerButton::Jump);
-            else      s.fake->releaseButton(PlayerButton::Jump);
-            held = down;
-        }
-        s.traceAhead = t + 1;
-        bool nearBefore = s.nearInteractable;
-        if (builtinWave) {
-            CCRect before = tracerRect();
-            // GD's player code is only needed when an orb, pad or portal is near
-            // (gravity flips, size changes); the position it computes is thrown
-            // away, because the built-in wave movement is exact.
-            if (nearBefore || t == 0) {
-                CCPoint keep = s.fake->m_position;
-                s.fake->update(stepDt);
-                setTracerPos(keep);
-            }
-            waveStep(held);
-
-            // Asking GD for the objects around the tracer is the expensive part.
-            // Nearby objects barely change from one tick to the next, so the
-            // list is only refreshed every 4 ticks, or every tick when an orb,
-            // pad or portal is near (so those still fire on the right tick).
-            // Moving objects are still moved to their predicted spot every tick.
-            // Slopes are checked against their exact shape, so near slopes the
-            // object list is refreshed every tick as well.
-            bool refresh = nearBefore || s.nearSlope || t == 0 || (t & 3) == 0;
-            if (refresh) {
-                s.lastKept.clear();
-                s.nearInteractable = false;
-                s.nearSlope = false;
-                pl->checkCollisions(s.fake, collDt, s.ignoreDamage);   // orbs, portals, moving objects
-            } else if (movingOn) {
-                for (auto obj : s.lastKept) moveAhead(obj, s.traceAhead);
-            }
-            if (!s.traceDied && waveCollide(before)) {
-                s.traceDied = true;
-                s.diagFallbackDeaths++;
-            }
-        } else {
-            s.lastKept.clear();
-            s.nearInteractable = false;
-            CCPoint p = s.fake->m_position;
-            s.fake->m_lastPosition = p;
-            setTracerPos(p);                      // both positions in sync before GD runs
-            s.fake->update(stepDt);               // GD: jumps, gravity, orbs, pads
-            CCPoint np(p.x + s.traceDx, pickNewY(p.y));
-            setTracerPos(np);                     // forward at your real speed
-            pl->checkCollisions(s.fake, collDt, s.ignoreDamage);
-            // Collisions may have moved it (landing on a block): keep that height.
-            setTracerPos(CCPoint(np.x, pickNewY(np.y)));
-        }
-        s.diagTicks = t + 1;
-
-        if (s.traceDied) { death = t; break; }
-        if (s.traceDone) break;
-        if ((t & 3) == 3 && std::chrono::steady_clock::now() > deadline) {
-            s.diagTimedOut = true;
-            break;
-        }
-    }
-
-    if (held) s.fake->releaseButton(PlayerButton::Jump);
-    s.diagMovedX = s.fake->m_position.x - startPos.x;
-    s.diagMovedY = s.fake->m_position.y - startPos.y;
-    s.orbCutoff = -1;
-    s.builtinActive = false;
-
-    // Put the level back exactly as it was.
-    restoreTouched();
-    restoreMoved();
-    removeNewChildren(pl->m_objectLayer, objLayerCount);
-    removeNewChildren(pl, plCount);
-
-    s.tracing = false;
-    s.traceDied = false;
-    s.traceDone = false;
-    return death;
-}
-
-// Finds the first tick (+0 .. +window) where this input doesn't kill you.
-// Returns that delay, or 0 if none is safe (input is sent on time).
-// Gamemodes the assist leaves alone:
-//  - ship and swing: nothing is checked
-//  - robot: presses are checked, releases are not
-// Dual: normal dual (one button for both players), not two-player mode.
-static bool twoPlayerMode(PlayLayer* pl) {
-    if constexpr (requires { pl->m_levelSettings->m_twoPlayerMode; }) {
-        return pl->m_levelSettings && pl->m_levelSettings->m_twoPlayerMode;
-    } else {
-        return false;
-    }
-}
-
-static bool dualActive(PlayLayer* pl) {
-    return pl->m_gameState.m_isDualMode && pl->m_player2 && !twoPlayerMode(pl)
-        && dualAssist();
-}
-
-// Predicts the input for player 1 and, in dual, for player 2 with its own
-// tracer. Returns the earliest death of either player, or -1 if both survive.
-static int traceAll(PlayLayer* pl, int delay, bool down, int maxTicks,
-                    std::chrono::steady_clock::time_point deadline) {
-    if (!ensureTracer(pl)) { s.diagReason = "no tracer"; return -1; }
-    s.fake = s.fake1;
-    int d1 = traceInput(pl, delay, down, maxTicks, deadline, pl->m_player1);
-    if (!dualActive(pl) || !s.diagReason.empty() || s.diagTimedOut) return d1;
-
-    bool orb1 = s.traceUsedOrb;
-    s.fake = s.fake2;
-    // Player 2 only needs to be checked up to where player 1 already died.
-    int limit = d1 >= 0 ? d1 + 1 : maxTicks;
-    int d2 = traceInput(pl, delay, down, limit, deadline, pl->m_player2);
-    s.fake = s.fake1;
-    s.traceUsedOrb = s.traceUsedOrb || orb1;
-    if (!s.diagReason.empty()) return d1;   // couldn't check P2: go by P1
-    if (d1 < 0) return d2;
-    if (d2 < 0) return d1;
-    return std::min(d1, d2);
-}
-
-static bool assistOff(PlayerObject* p, bool down) {
-    if (p->m_isSwing) return true;
-    // Ship: with Ship assist on, ship clicks and releases are checked like any
-    // other mode. With it off, only orb clicks are assisted (see planInput).
-    if (p->m_isShip && !down && !shipAssist()) return true;
-    if (p->m_isRobot && !down) return true;
-    return false;
-}
-
-static int planInput(PlayLayer* pl, PendingInput& in) {
-    // Not assisted in this gamemode: the input goes through on time.
-    // In dual, the input is assisted if either player is in an assisted mode
-    // (both players are still predicted, so it's only moved when both survive).
-    bool off = assistOff(pl->m_player1, in.down);
-    if (off && dualActive(pl)) off = assistOff(pl->m_player2, in.down);
-    if (off) {
-        in.skipped = true;
-        in.foundSafe = true;
-        in.firstDeath = -1;
-        s.planMs = 0.0;
-        return 0;
-    }
-
-    // Test setting: delay every press by a fixed amount, no prediction at all.
-    // Used to check that holding back inputs works by itself.
-    if (forceDelay() > 0 && in.down) {
-        in.firstDeath = 0;
-        in.foundSafe = true;
-        s.planMs = 0.0;
-        s.diagReason = "forced delay test";
-        return forceDelay();
-    }
-
-    auto start = std::chrono::steady_clock::now();
-
-    // Frame budget: all checks within one drawn frame share this much time.
-    // In fast spam, many inputs land in the same frame; without a shared cap
-    // their checks added up to long freezes.
-    unsigned int frame = CCDirector::get()->getTotalFrames();
-    if (frame != s.budgetFrame) {
-        s.budgetFrame = frame;
-        s.budgetUsedMs = 0.0;
-    }
-    double leftMs = static_cast<double>(frameBudgetMs()) - s.budgetUsedMs;
-    if (leftMs <= 0.2) {
-        // Out of time for this frame: send on time, unchecked.
-        s.diagReason = "frame budget used up";
-        in.foundSafe = true;
-        in.firstDeath = -1;
-        s.planMs = 0.0;
-        return 0;
-    }
-    double limitMs = std::min(static_cast<double>(checkTimeMs()), leftMs);
-    // Spam inputs can only move a tick or so anyway, so they get a short check.
-    if (in.spam) limitMs = std::min(limitMs, 0.75);
-    auto deadline = start + std::chrono::microseconds(static_cast<long long>(limitMs * 1000.0));
-
-    // How far ahead to look for a death after this input:
-    //  - your releases: the release safety check (falling into something after
-    //    letting go early often happens later than a click's death would)
-    //  - presses and Release Assist: the normal or wave safety check
-    int look = (!in.down && !in.autoRelease) ? releaseLookahead()
-             : pl->m_player1->m_isDart ? waveLookahead() : lookaheadTicks();
-    s.lastLook = look;
-    // Presses and releases each have their own search window.
-    int window = in.down ? assistWindow() : releaseWindow();
-    if (in.spam) window = std::min(window, spamMaxDelay());
-    int chosen = 0;
-    in.foundSafe = false;
-    in.firstDeath = -1;
-
-    // Random pick: when a click has to be moved, every tick in the window is
-    // checked and one of the safe ones is picked at random, instead of always
-    // the first. A click that's already safe on time is never moved.
-    bool collectAll = randomPick() && in.down && !in.spam && !in.autoRelease;
-    std::vector<int> safeTicks;
-
-    // Edge margin: when an input has to be moved, the first safe tick is right
-    // at the edge of the safe zone, where small prediction errors hurt most.
-    // So the search continues through the safe ticks that follow, and the input
-    // goes to the middle of that safe run (up to `margin` ticks in).
-    int margin = in.spam ? 0 : edgeMargin();
-    int runStart = -1;
-    int runLen = 0;
-
-    for (int d = 0; d <= window; ++d) {
-        int death = traceAll(pl, d, in.down, d + look, deadline);
-        if (d == 0) {
-            in.firstDeath = death;
-            // A click on/near an orb uses the orb search window instead.
-            if (in.down && s.traceUsedOrb && !in.spam) {
-                window = orbWindow();
-                in.orb = true;
-            }
-            // Ship: a click that doesn't use an orb is a normal ship click and
-            // goes through untouched. Only orb clicks get held back.
-            if (pl->m_player1->m_isShip && !shipAssist() && in.down && !in.orb && s.diagReason.empty()) {
-                in.skipped = true;
-                in.foundSafe = true;
-                in.firstDeath = -1;
-                chosen = 0;
-                break;
-            }
-        }
-        // Couldn't check (see SKIPPED reason): send on time.
-        if (!s.diagReason.empty()) { chosen = 0; in.foundSafe = true; safeTicks.clear(); break; }
-        // Ran out of time: use the safe ticks found so far, otherwise on time.
-        if (s.diagTimedOut) { break; }
-        // Died before the input was even sent: every later tick shares that same
-        // path, so none of them can be safe. Stop here instead of wasting time.
-        if (death >= 0 && death < d) break;
-
-        // Already inside a safe run: extend it, or stop at its end.
-        if (runStart >= 0) {
-            if (death >= 0) break;
-            runLen++;
-            if (runLen >= 2 * margin + 1) break;   // enough room to sit `margin` ticks in
-            continue;
-        }
-
-        if (death < 0) {
-            if (d == 0) { chosen = 0; in.foundSafe = true; in.checked = true; safeTicks.clear(); break; }
-            if (collectAll) { safeTicks.push_back(d); continue; }
-            if (margin <= 0) { chosen = d; in.foundSafe = true; in.checked = true; break; }
-            runStart = d;
-            runLen = 1;
-        }
-    }
-
-    if (runStart >= 0) {
-        // Middle of the safe run, at most `margin` ticks past its first tick.
-        chosen = runStart + std::min(margin, (runLen - 1) / 2);
-        in.foundSafe = true;
-        in.checked = true;
-        in.safeCount = runLen;
-        in.edgeRun = true;
-    }
-
-    if (!safeTicks.empty()) {
-        static std::mt19937 rng{std::random_device{}()};
-        std::uniform_int_distribution<size_t> pick(0, safeTicks.size() - 1);
-        chosen = safeTicks[pick(rng)];
-        in.foundSafe = true;
-        in.checked = true;
-        in.safeCount = static_cast<int>(safeTicks.size());
-    }
-
-    s.planMs = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start).count();
-    s.budgetUsedMs += s.planMs;
-    return chosen;
-}
-
-static void logDecision(PendingInput const& in, int delay) {
-    if (in.skipped || !s.debugOn) return;
-    char const* what = in.autoRelease ? "auto-release"
-                     : in.orb ? "orb    "
-                     : in.spam ? (in.down ? "press* " : "release*")
-                               : (in.down ? "press  " : "release");
-    if (in.firstDeath < 0) {
-        debugLine(fmt::format("{} +0 safe  ({:.2f}ms)", what, s.planMs));
-    } else if (in.foundSafe) {
-        if (in.edgeRun) {
-            debugLine(fmt::format("{} dies@{} -> +{} (safe run of {})  ({:.2f}ms)",
-                                  what, in.firstDeath, delay, in.safeCount, s.planMs));
-        } else if (in.safeCount > 1) {
-            debugLine(fmt::format("{} dies@{} -> +{} (random of {} safe)  ({:.2f}ms)",
-                                  what, in.firstDeath, delay, in.safeCount, s.planMs));
-        } else {
-            debugLine(fmt::format("{} dies@{} -> +{}  ({:.2f}ms)", what, in.firstDeath, delay, s.planMs));
-        }
-    } else {
-        debugLine(fmt::format("{} dies@{}, none safe -> on time  ({:.2f}ms){}",
-                              what, in.firstDeath, s.planMs,
-                              s.diagTimedOut ? "  OUT OF TIME" : ""));
-    }
-    debugDiag();
-}
-
-// ---------- game layer hooks ----------
-
-class $modify(AssistGameLayer, GJBaseGameLayer) {
-    bool isActivePlayLayer() {
-        auto pl = PlayLayer::get();
-        return pl && static_cast<GJBaseGameLayer*>(pl) == this;
-    }
-
-    void applied(PendingInput const& in, int fireTick) {
-        s.heldInGame = in.down;
-        if (in.down) s.holdStartTick = fireTick;
-        if (in.autoRelease) s.autoReleased = true;
-        // A delayed press shifts its release by the same amount, so your hold
-        // length stays exactly the same. After a release, nothing carries over.
-        s.pressShift = in.down ? (fireTick - in.realTick) : 0;
-    }
-
-    void handleButton(bool down, int button, bool isPlayer1) {
-        if (s.injecting || s.tracing || !assistEnabled() || !isActivePlayLayer()
-            || button != 1 || !isPlayer1) {
-            return GJBaseGameLayer::handleButton(down, button, isPlayer1);
-        }
-
-        auto pl = PlayLayer::get();
-        if (pl->m_player1->m_isPlatformer) {
-            return GJBaseGameLayer::handleButton(down, button, isPlayer1);
-        }
-
-        // Release Assist bookkeeping.
-        s.physHeld = down;
-        if (down) {
-            s.autoReleased = false;
-            s.nextAutoCheck = 0;
-        } else {
-            if (s.autoReleased) {
-                // Release Assist already let go for you: the game isn't holding,
-                // so your own release has nothing left to do.
-                s.autoReleased = false;
-                return;
-            }
-            // You let go before Release Assist's planned release: drop that plan
-            // and handle your own release normally.
-            for (auto it = s.queue.begin(); it != s.queue.end();) {
-                if (it->autoRelease) it = s.queue.erase(it);
-                else ++it;
-            }
-        }
-
-        // Not assisted in this gamemode (ship, swing, robot releases). If nothing
-        // is waiting, the input goes straight through; otherwise it queues
-        // behind the waiting ones to keep the order.
-        // A robot release after a delayed press still waits for its shift, so
-        // the jump keeps the height you played; it just isn't checked.
-        bool needsShift = !down && s.pressShift > 0;
-        if (assistOff(pl->m_player1, down) && s.queue.empty() && !needsShift) {
-            s.heldInGame = down;
-            if (down) s.holdStartTick = s.tick;
-            s.pressShift = 0;
-            return GJBaseGameLayer::handleButton(down, button, isPlayer1);
-        }
-
-        // Dual mode without Dual assist, or two-player mode (split controls):
-        // the assist steps aside completely. Anything still waiting is sent
-        // right now, and every input goes straight to the game.
-        if (m_gameState.m_isDualMode && !dualActive(pl)) {
-            flushQueue();
-            s.heldInGame = down;
-            if (down) s.holdStartTick = s.tick;
-            s.pressShift = 0;
-            return GJBaseGameLayer::handleButton(down, button, isPlayer1);
-        }
-
-        // Wave spam fix: PRESSES closer together than the spam gap count as spam
-        // (measured press to press, so a normal quick tap is not spam). A release
-        // belongs to its press: it's spam only if that press was.
-        // While spamming, nothing is allowed to pile up: anything still waiting
-        // is sent right now, and each input may only move a tiny bit.
-        bool spamming = false;
-        if (down) {
-            int gap = s.tick - s.lastRealInputTick;
-            s.lastRealInputTick = s.tick;
-            spamming = waveSpamFix() && pl->m_player1->m_isDart && gap < spamGap();
-            s.pressWasSpam = spamming;
-        } else {
-            spamming = s.pressWasSpam && waveSpamFix() && pl->m_player1->m_isDart;
-        }
-
-        if (spamming && !s.queue.empty()) {
-            int flushed = static_cast<int>(s.queue.size());
-            flushQueue();
-            debugLine(fmt::format("wave spam: sent {} waiting input(s) now", flushed));
-        }
-
-        PendingInput in;
-        in.down = down;
-        in.spam = spamming;
-        in.realTick = s.tick;
-        in.base = s.tick + ((down || spamming) ? 0 : s.pressShift);
-
-        if (s.queue.empty() && in.base <= s.tick) {
-            int delay = planInput(pl, in);
-            logDecision(in, delay);
-            if (delay == 0) {
-                // Safe now (or nothing better): goes through untouched.
-                applied(in, s.tick);
-                return GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            }
-            in.fireTick = s.tick + delay;
-        }
-        s.queue.push_back(in);
-    }
-
-    // Sends everything still waiting right now, in order.
-    void flushQueue() {
-        while (!s.queue.empty()) {
-            PendingInput w = s.queue.front();
-            s.queue.pop_front();
-            injectButton(this, w.down);
-            applied(w, s.tick);
-        }
-        s.pressShift = 0;
-    }
-
-    // Release Assist: once you've held longer than the limit, find the first tick
-    // where letting go doesn't kill you (same check as normal inputs) and let go
-    // for you there. If no tick is safe yet, it keeps you holding and looks again.
-    void releaseAssistCheck() {
-        if (!releaseAssist()) return;
-        if (!s.physHeld || !s.heldInGame || s.autoReleased || !s.queue.empty()) return;
-        if (m_gameState.m_isDualMode) return;
-        auto pl = PlayLayer::get();
-        auto p = pl->m_player1;
-        // Release Assist never lets go for you in ship: holding is how ship flies.
-        if (p->m_isPlatformer || p->m_isShip || assistOff(p, false)) return;   // ship, swing, robot
-        if (s.tick - s.holdStartTick < releaseAssistAfter()) return;
-        if (s.tick < s.nextAutoCheck) return;
-
-        PendingInput in;
-        in.down = false;
-        in.autoRelease = true;
-        in.realTick = s.tick;
-        in.base = s.tick;
-        int delay = planInput(pl, in);
-
-        if (in.checked) {
-            logDecision(in, delay);
-            in.fireTick = s.tick + delay;
-            s.queue.push_back(in);
-        } else {
-            // Nothing safe (or couldn't check): keep holding, look again soon.
-            s.nextAutoCheck = s.tick + std::max(1, releaseWindow());
-        }
-    }
-
-    // Moving objects: watches the area AHEAD of you every tick, so objects already
-    // have a known speed by the time you click near them. One cheap lookup per
-    // tick, cycling through four spots in front of / above / below you.
-    void scoutAhead() {
-        if (!predictMoving() || s.realDx < 0.01f || s.collideDt <= 0.f || !m_player1) return;
-        auto pl = PlayLayer::get();
-        if (!ensureTracer(pl)) return;
-
-        static const float aheadTicks[4] = {10.f, 25.f, 18.f, 18.f};
-        static const float yOffset[4]    = {0.f, 0.f, 50.f, -50.f};
-        int k = s.tick & 3;
-
-        copyPlayerState(s.fake, m_player1);
-        s.nodeOffset = m_player1->getPosition() - m_player1->m_position;
-        CCPoint p = m_player1->m_position;
-        p.x += s.realDx * aheadTicks[k];
-        p.y += yOffset[k];
-        s.fake->m_lastPosition = p;
-        setTracerPos(p);
-
-        s.tracing = true;
-        s.scouting = true;
-        pl->checkCollisions(s.fake, s.collideDt, s.ignoreDamage);
-        s.scouting = false;
-        s.tracing = false;
-        s.traceDied = false;
-        s.traceDone = false;
-    }
-
-    // Sends queued inputs in order, each on its planned tick.
-    void processQueue() {
-        if (m_gameState.m_isDualMode && !dualActive(PlayLayer::get())) { flushQueue(); return; }
-        auto pl = PlayLayer::get();
-        while (!s.queue.empty()) {
-            auto& in = s.queue.front();
-
-            if (in.fireTick < 0) {
-                if (s.tick < in.base) break;
-                int delay = planInput(pl, in);
-                logDecision(in, delay);
-                in.fireTick = s.tick + delay;
-            }
-            if (s.tick < in.fireTick) break;
-
-            PendingInput done = in;
-            s.queue.pop_front();
-            injectButton(this, done.down);
-            applied(done, s.tick);
-
-            // A following release keeps the hold length of the press it belongs to.
-            if (done.down) {
-                for (auto& next : s.queue) {
-                    if (!next.down && next.fireTick < 0) {
-                        next.base = next.realTick + s.pressShift;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Called once per physics tick (240 per second).
-    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (s.tracing || !assistEnabled() || !isActivePlayLayer()) {
-            return GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-        }
-        s.debugOn = debugPanel();
-
-        // Measure how far you really move per tick, from one tick's start to the
-        // next. This works no matter where in the tick GD moves the player.
-        if (m_player1) {
-            float x = m_player1->m_position.x;
-            float y = m_player1->m_position.y;
-            if (s.prevTickNum == s.tick - 1) {
-                float dx = x - s.prevTickX;
-                float dy = y - s.prevTickY;
-                if (dx > 0.01f && dx < 100.f) {
-                    s.realDx = dx;   // ignore resets/teleports
-                    if (m_player1->m_isDart) measureWaveSlope(m_player1, dx, dy);
-                }
-            }
-            s.prevTickX = x;
-            s.prevTickY = y;
-            s.prevTickNum = s.tick;
-        }
-
-        releaseAssistCheck();
-        processQueue();
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-        scoutAhead();
-        s.tick++;
-    }
-
-    int checkCollisions(PlayerObject* player, float dt, bool ignoreDamage) {
-        if (!s.tracing && isActivePlayLayer() && player == m_player1) s.collideDt = dt;
-        return GJBaseGameLayer::checkCollisions(player, dt, ignoreDamage);
-    }
-
-    // What the tracer collides with:
-    //  - blocks, spikes, slopes: normally, plus our own hitbox check as a backup
-    //  - orbs, pads, gravity/size portals: used normally, activation restored afterwards
-    //  - gamemode/dual/teleport portals, spider/teleport orbs: trace stops there
-    //  - everything else (coins, triggers, decoration): ignored
-    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
-                               int count, float dt) {
-        // Scouting: just remember where the objects ahead are, nothing else runs.
-        if (s.scouting && player == s.fake && objects) {
-            trackObjects(objects, std::min(count, static_cast<int>(objects->size())));
-            return;
-        }
-        if (!s.tracing || player != s.fake || !objects) {
-            if (!s.tracing && objects && assistEnabled() && predictMoving()
-                && isActivePlayLayer() && player == m_player1) {
-                trackObjects(objects, std::min(count, static_cast<int>(objects->size())));
-            }
-            return GJBaseGameLayer::collisionCheckObjects(player, objects, count, dt);
-        }
-
-        static gd::vector<GameObject*> kept;
-        kept.clear();
-        auto playerRect = s_realPlayer ? tracerRect() : player->getObjectRect();
-        int n = std::min(count, static_cast<int>(objects->size()));
-
-        for (int i = 0; i < n; ++i) {
-            auto obj = (*objects)[i];
-            if (!obj) continue;
-            auto type = obj->m_objectType;
-
-            // Speed portals only change the tracer's own speed.
-            if (auto sp = speedForPortal(obj->m_objectID)) {
-                if (playerRect.intersectsRect(obj->getObjectRect())) tracerHitSpeedPortal(sp);
-                continue;
-            }
-
-            if (isSolidOrHazard(type)) {
-                kept.push_back(obj);
-            } else if (isPlayerOnlyInteractable(type)) {
-                if (isOrb(type) && s.orbCutoff >= 0) {
-                    if (s.traceAhead > s.orbCutoff) continue;
-                    s.traceUsedOrb = true;
-                }
-                rememberTouched(obj);
-                kept.push_back(obj);
-            } else if (isLevelChangingPortal(type)) {
-                if (playerRect.intersectsRect(obj->getObjectRect())) s.traceDone = true;
-            }
-        }
-
-        // Moving objects: put each one where it will be at this point of the prediction.
-        if (predictMoving() && s.traceAhead > 0) {
-            for (auto obj : kept) moveAhead(obj, s.traceAhead);
-        }
-
-        for (auto obj : kept) {
-            if (isPlayerOnlyInteractable(obj->m_objectType)) s.nearInteractable = true;
-            if (obj->m_objectType == GameObjectType::Slope) s.nearSlope = true;
-        }
-
-        s.diagCollChecks++;
-        s.diagMaxObjs = std::max(s.diagMaxObjs, static_cast<int>(kept.size()));
-
-        // What GD itself gets to collide the tracer with. Spikes are never
-        // handed to GD: touching one would make GD run its death code for the
-        // tracer, and mods like Mega Hack's noclip count that as YOUR death,
-        // however they're hooked. The mod detects spike deaths itself (below).
-        // In wave, blocks and slopes aren't handed over either: the built-in
-        // wave physics handles them completely, so GD never "kills" the
-        // wave tracer at all. Orbs, pads and portals still go to GD.
-        static gd::vector<GameObject*> forGD;
-        forGD.clear();
-        for (auto obj : kept) {
-            auto type = obj->m_objectType;
-            if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) continue;
-            if (s.builtinActive && (type == GameObjectType::Solid || type == GameObjectType::Slope)) continue;
-            forGD.push_back(obj);
-        }
-        GJBaseGameLayer::collisionCheckObjects(player, &forGD, static_cast<int>(forGD.size()), dt);
-
-        // GD can check a step in several batches, so collect all of them.
-        s.lastKept.insert(s.lastKept.end(), kept.begin(), kept.end());
-        if (s.builtinActive) return;   // built-in wave physics does its own collision
-
-        // Backup death check, in case the game doesn't report the tracer's death:
-        // spikes kill on the full hitbox, blocks kill on the small inner hitbox.
-        // Uses your real hitbox size moved to the tracer, so the size is always right.
-        if (!s.traceDied && s_realPlayer) {
-            auto outer = tracerRect();
-            auto inner = innerRect(outer, 0.3f);
-            for (auto obj : kept) {
-                if (startedInside(obj)) continue;
-                auto type = obj->m_objectType;
-                bool hit = false;
-                if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) {
-                    hit = outer.intersectsRect(obj->getObjectRect());
-                } else if (type == GameObjectType::Solid) {
-                    hit = inner.intersectsRect(obj->getObjectRect());
-                } else if (type == GameObjectType::Slope) {
-                    hit = triOverlapsRect(slopeTriangle(obj), inner);
-                }
-                if (hit) {
-                    s.traceDied = true;
-                    s.diagFallbackDeaths++;
-                    break;
-                }
-            }
-        }
-    }
-};
-
-// ---------- player hook (records the real update dt) ----------
-
-class $modify(AssistPlayer, PlayerObject) {
-    void update(float dt) {
-        if (!s.tracing) {
-            auto pl = PlayLayer::get();
-            if (pl && pl->m_player1 == this) s.playerDt = dt;
-        }
-        PlayerObject::update(dt);
-    }
-};
-
-// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
-
-class $modify(AssistPlayLayer, PlayLayer) {
-    struct Fields {
-        CCLabelBMFont* label = nullptr;
-    };
-
-    // The tracer's "deaths" go through GD's death function. Other mods that
-    // hook it (noclip death counters, death sounds, accuracy trackers) would
-    // count those as your deaths. Running this mod's hook first means a
-    // tracer death is caught and stopped before any other mod sees it.
-    // Written so it compiles whichever priority API your Geode version has.
-    static void onModify(auto& self) {
-        constexpr int kFirst = -3000;
-        if constexpr (requires { self.setHookPriorityPre("PlayLayer::destroyPlayer", kFirst); }) {
-            (void)self.setHookPriorityPre("PlayLayer::destroyPlayer", kFirst);
-        } else if constexpr (requires { self.setHookPriority("PlayLayer::destroyPlayer", kFirst); }) {
-            (void)self.setHookPriority("PlayLayer::destroyPlayer", kFirst);
-        }
-    }
-
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        s.reset();
-        s.fake = nullptr;
-        s.owner = nullptr;
-        s.playerDt = 0.f;
-        s.collideDt = 0.f;
-        s.debugLabel = nullptr;
-
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-
-        if (assistEnabled()) m_isTestMode = true;
-
-        auto win = CCDirector::get()->getWinSize();
-
-        auto label = CCLabelBMFont::create("", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setOpacity(180);
-        label->setAnchorPoint({1.f, 0.f});
-        label->setPosition({win.width - 5.f, 5.f});
-        m_uiLayer->addChild(label, 1000);
-        m_fields->label = label;
-
-        auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
-        dbg->setScale(0.5f);
-        dbg->setAnchorPoint({0.f, 1.f});
-        dbg->setAlignment(kCCTextAlignmentLeft);
-        dbg->setPosition({5.f, win.height - 5.f});
-        m_uiLayer->addChild(dbg, 1000);
-        s.debugLabel = dbg;
-
-        updateAssistLabel();
-        return true;
-    }
-
-    void updateAssistLabel() {
-        bool on = assistEnabled();
-        if (auto label = m_fields->label) {
-            label->setVisible(on);
-            if (on) {
-                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
-                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
-            }
-        }
-        if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
-    }
-
-    void resetLevel() {
-        PlayLayer::resetLevel();
-        s.reset();
-        // Safe mode: test mode stops progress and completions from saving.
-        if (assistEnabled()) m_isTestMode = true;
-        if (s.debugLabel) s.debugLabel->setString("");
-        updateAssistLabel();
-    }
-
-    void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        if (s.tracing) {
-            if (player == s.fake && !startedInside(obj)) s.traceDied = true;
-            return;
-        }
-        PlayLayer::destroyPlayer(player, obj);
-    }
-
-    void levelComplete() {
-        if (s.tracing) { s.traceDone = true; return; }
-        PlayLayer::levelComplete();
-    }
-};
-
-// ---------- pause menu: settings button ----------
-
-class $modify(AssistPause, PauseLayer) {
-    void customSetup() {
-        PauseLayer::customSetup();
-
-        auto spr = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
-        spr->setScale(0.6f);
-        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(AssistPause::onAssistSettings));
-
-        auto menu = CCMenu::create();
-        menu->addChild(btn);
-        menu->setPosition({35.f, 35.f});
-        this->addChild(menu, 10);
-    }
-
-    void onAssistSettings(CCObject*) {
-        geode::openSettingsPopup(Mod::get());
-    }
-};
