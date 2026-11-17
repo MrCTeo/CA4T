@@ -13,6 +13,9 @@
 
 using namespace geode::prelude;
 
+// Shown in the corner label so you can see which build is running.
+static constexpr char const* kBuildTag = "tracer-v44";
+
 // =====================================================================
 // How it works
 //
@@ -49,6 +52,7 @@ static int  orbCatch()       { return static_cast<int>(Mod::get()->getSettingVal
 static int  checkTimeMs()    { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("check-time")); }
 static int  frameBudgetMs()  { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("frame-budget")); }
 static int  edgeMargin()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("edge-margin")); }
+static bool dualAssist()     { return Mod::get()->getSettingValue<bool>("dual-assist"); }
 static bool shipAssist()     { return Mod::get()->getSettingValue<bool>("ship-assist"); }
 static bool randomPick()     { return Mod::get()->getSettingValue<bool>("random-pick"); }
 static int  forceDelay()     { return static_cast<int>(Mod::get()->getSettingValue<int64_t>("force-delay")); }
@@ -76,7 +80,9 @@ struct AssistState {
     int tick = 0;
 
     // Tracer
-    PlayerObject* fake = nullptr;
+    PlayerObject* fake = nullptr;        // tracer currently being flown
+    PlayerObject* fake1 = nullptr;       // tracer for player 1
+    PlayerObject* fake2 = nullptr;       // tracer for player 2 (dual)
     PlayLayer* owner = nullptr;
     bool tracing = false;
     bool traceDied = false;
@@ -450,12 +456,16 @@ static bool ensureTracer(PlayLayer* pl) {
     // created with `false` (like the ones in the main menu) don't run their own
     // physics, which is why the tracer never moved.
     auto fake = PlayerObject::create(1, 1, pl, hidden, true);
-    if (!fake) return false;
-    // Not hidden itself: GD may skip updating a hidden player. Its parent layer
-    // is hidden, so it's still never drawn.
+    auto fake2 = PlayerObject::create(1, 1, pl, hidden, true);
+    if (!fake || !fake2) return false;
+    // Not hidden themselves: GD may skip updating a hidden player. Their parent
+    // layer is hidden, so they're still never drawn.
     hidden->addChild(fake);
+    hidden->addChild(fake2);
 
     s.fake = fake;
+    s.fake1 = fake;
+    s.fake2 = fake2;
     s.owner = pl;
     return true;
 }
@@ -745,8 +755,10 @@ static bool waveCollide(CCRect const& before) {
 // Flies the tracer: keeps the current button state for `delay` ticks, then
 // applies the input (`down`), then keeps that state until `maxTicks`.
 // Returns the tick it died on, or -1 if it survived.
+// `real` is the player being predicted (player 1, or player 2 in dual).
 static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
-                      std::chrono::steady_clock::time_point deadline) {
+                      std::chrono::steady_clock::time_point deadline,
+                      PlayerObject* real) {
     // A press is checked as exactly that one click: it can fire the orb you
     // click on (GD gives a click a couple of ticks to catch an orb), but orbs
     // reached later need a new click, so the tracer doesn't take them.
@@ -776,16 +788,16 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
     // Wave: built-in wave physics, exact and independent of GD's player code.
     // Other modes: GD's own physics for height (jumps, gravity, orbs, pads) at
     // the game's real timestep, and your measured speed for forward movement.
-    bool builtinWave = pl->m_player1->m_isDart;
+    bool builtinWave = real->m_isDart;
     s.builtinActive = builtinWave;
-    s_realPlayer = pl->m_player1;
-    s.nodeOffset = pl->m_player1->getPosition() - pl->m_player1->m_position;
+    s_realPlayer = real;
+    s.nodeOffset = real->getPosition() - real->m_position;
     float stepDt = s.playerDt;
     float collDt = s.collideDt;
 
-    copyPlayerState(s.fake, pl->m_player1);
+    copyPlayerState(s.fake, real);
     auto startPos = s.fake->m_position;
-    s.diagStartDiff = ccpDistance(startPos, pl->m_player1->m_position);
+    s.diagStartDiff = ccpDistance(startPos, real->m_position);
 
     unsigned int objLayerCount = pl->m_objectLayer ? pl->m_objectLayer->getChildrenCount() : 0;
     unsigned int plCount = pl->getChildrenCount();
@@ -931,6 +943,42 @@ static int traceInput(PlayLayer* pl, int delay, bool down, int maxTicks,
 // Gamemodes the assist leaves alone:
 //  - ship and swing: nothing is checked
 //  - robot: presses are checked, releases are not
+// Dual: normal dual (one button for both players), not two-player mode.
+static bool twoPlayerMode(PlayLayer* pl) {
+    if constexpr (requires { pl->m_levelSettings->m_twoPlayerMode; }) {
+        return pl->m_levelSettings && pl->m_levelSettings->m_twoPlayerMode;
+    } else {
+        return false;
+    }
+}
+
+static bool dualActive(PlayLayer* pl) {
+    return pl->m_gameState.m_isDualMode && pl->m_player2 && !twoPlayerMode(pl)
+        && dualAssist();
+}
+
+// Predicts the input for player 1 and, in dual, for player 2 with its own
+// tracer. Returns the earliest death of either player, or -1 if both survive.
+static int traceAll(PlayLayer* pl, int delay, bool down, int maxTicks,
+                    std::chrono::steady_clock::time_point deadline) {
+    if (!ensureTracer(pl)) { s.diagReason = "no tracer"; return -1; }
+    s.fake = s.fake1;
+    int d1 = traceInput(pl, delay, down, maxTicks, deadline, pl->m_player1);
+    if (!dualActive(pl) || !s.diagReason.empty() || s.diagTimedOut) return d1;
+
+    bool orb1 = s.traceUsedOrb;
+    s.fake = s.fake2;
+    // Player 2 only needs to be checked up to where player 1 already died.
+    int limit = d1 >= 0 ? d1 + 1 : maxTicks;
+    int d2 = traceInput(pl, delay, down, limit, deadline, pl->m_player2);
+    s.fake = s.fake1;
+    s.traceUsedOrb = s.traceUsedOrb || orb1;
+    if (!s.diagReason.empty()) return d1;   // couldn't check P2: go by P1
+    if (d1 < 0) return d2;
+    if (d2 < 0) return d1;
+    return std::min(d1, d2);
+}
+
 static bool assistOff(PlayerObject* p, bool down) {
     if (p->m_isSwing) return true;
     // Ship: with Ship assist on, ship clicks and releases are checked like any
@@ -942,7 +990,11 @@ static bool assistOff(PlayerObject* p, bool down) {
 
 static int planInput(PlayLayer* pl, PendingInput& in) {
     // Not assisted in this gamemode: the input goes through on time.
-    if (assistOff(pl->m_player1, in.down)) {
+    // In dual, the input is assisted if either player is in an assisted mode
+    // (both players are still predicted, so it's only moved when both survive).
+    bool off = assistOff(pl->m_player1, in.down);
+    if (off && dualActive(pl)) off = assistOff(pl->m_player2, in.down);
+    if (off) {
         in.skipped = true;
         in.foundSafe = true;
         in.firstDeath = -1;
@@ -1013,7 +1065,7 @@ static int planInput(PlayLayer* pl, PendingInput& in) {
     int runLen = 0;
 
     for (int d = 0; d <= window; ++d) {
-        int death = traceInput(pl, d, in.down, d + look, deadline);
+        int death = traceAll(pl, d, in.down, d + look, deadline);
         if (d == 0) {
             in.firstDeath = death;
             // A click on/near an orb uses the orb search window instead.
@@ -1167,10 +1219,10 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
             return GJBaseGameLayer::handleButton(down, button, isPlayer1);
         }
 
-        // Dual mode: the assist steps aside completely. Anything still waiting is
-        // sent right now, and every input goes straight to the game, so both
-        // players always get your clicks exactly as you make them.
-        if (m_gameState.m_isDualMode) {
+        // Dual mode without Dual assist, or two-player mode (split controls):
+        // the assist steps aside completely. Anything still waiting is sent
+        // right now, and every input goes straight to the game.
+        if (m_gameState.m_isDualMode && !dualActive(pl)) {
             flushQueue();
             s.heldInGame = down;
             if (down) s.holdStartTick = s.tick;
@@ -1291,7 +1343,7 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
 
     // Sends queued inputs in order, each on its planned tick.
     void processQueue() {
-        if (m_gameState.m_isDualMode) { flushQueue(); return; }
+        if (m_gameState.m_isDualMode && !dualActive(PlayLayer::get())) { flushQueue(); return; }
         auto pl = PlayLayer::get();
         while (!s.queue.empty()) {
             auto& in = s.queue.front();
@@ -1420,7 +1472,23 @@ class $modify(AssistGameLayer, GJBaseGameLayer) {
 
         s.diagCollChecks++;
         s.diagMaxObjs = std::max(s.diagMaxObjs, static_cast<int>(kept.size()));
-        GJBaseGameLayer::collisionCheckObjects(player, &kept, static_cast<int>(kept.size()), dt);
+
+        // What GD itself gets to collide the tracer with. Spikes are never
+        // handed to GD: touching one would make GD run its death code for the
+        // tracer, and mods like Mega Hack's noclip count that as YOUR death,
+        // however they're hooked. The mod detects spike deaths itself (below).
+        // In wave, blocks and slopes aren't handed over either: the built-in
+        // wave physics handles them completely, so GD never "kills" the
+        // wave tracer at all. Orbs, pads and portals still go to GD.
+        static gd::vector<GameObject*> forGD;
+        forGD.clear();
+        for (auto obj : kept) {
+            auto type = obj->m_objectType;
+            if (type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard) continue;
+            if (s.builtinActive && (type == GameObjectType::Solid || type == GameObjectType::Slope)) continue;
+            forGD.push_back(obj);
+        }
+        GJBaseGameLayer::collisionCheckObjects(player, &forGD, static_cast<int>(forGD.size()), dt);
 
         // GD can check a step in several batches, so collect all of them.
         s.lastKept.insert(s.lastKept.end(), kept.begin(), kept.end());
@@ -1465,9 +1533,13 @@ class $modify(AssistPlayer, PlayerObject) {
     }
 };
 
-// ---------- play layer: tracer deaths, debug panel ----------
+// ---------- play layer: tracer deaths, label, debug panel, safe mode ----------
 
 class $modify(AssistPlayLayer, PlayLayer) {
+    struct Fields {
+        CCLabelBMFont* label = nullptr;
+    };
+
     // The tracer's "deaths" go through GD's death function. Other mods that
     // hook it (noclip death counters, death sounds, accuracy trackers) would
     // count those as your deaths. Running this mod's hook first means a
@@ -1492,7 +1564,17 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
+        if (assistEnabled()) m_isTestMode = true;
+
         auto win = CCDirector::get()->getWinSize();
+
+        auto label = CCLabelBMFont::create("", "bigFont.fnt");
+        label->setScale(0.35f);
+        label->setOpacity(180);
+        label->setAnchorPoint({1.f, 0.f});
+        label->setPosition({win.width - 5.f, 5.f});
+        m_uiLayer->addChild(label, 1000);
+        m_fields->label = label;
 
         auto dbg = CCLabelBMFont::create("", "chatFont.fnt");
         dbg->setScale(0.5f);
@@ -1508,12 +1590,21 @@ class $modify(AssistPlayLayer, PlayLayer) {
 
     void updateAssistLabel() {
         bool on = assistEnabled();
+        if (auto label = m_fields->label) {
+            label->setVisible(on);
+            if (on) {
+                std::string ra = releaseAssist() ? fmt::format(" RA{}", releaseAssistAfter()) : "";
+                label->setString(fmt::format("CA {}p/{}r{} {}", assistWindow(), releaseWindow(), ra, kBuildTag).c_str());
+            }
+        }
         if (s.debugLabel) s.debugLabel->setVisible(on && debugPanel());
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         s.reset();
+        // Safe mode: test mode stops progress and completions from saving.
+        if (assistEnabled()) m_isTestMode = true;
         if (s.debugLabel) s.debugLabel->setString("");
         updateAssistLabel();
     }
